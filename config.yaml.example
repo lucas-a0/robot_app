@@ -1,0 +1,37 @@
+# 小智 BLE 控制桥接配置示例
+# 复制为 ~/.config/xiaozhi-ble/config.yaml 后按需修改
+
+# 对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket 路径，
+# 必须与对话模块配置中的 control.socket_path 一致。
+control_socket_path: /tmp/xiaozhi-control.sock
+
+# BLE 广播与 BlueZ 适配器
+bluetooth:
+  adapter: /org/bluez/hci0      # BlueZ 适配器 D-Bus 路径，通常第一个适配器为 hci0
+  name: Xiaozhi                 # BLE 广播名称；App 应优先按 Service UUID 筛选
+
+# 电量获取（本模块自己订阅，不经过对话模块）
+# 通过内置的 rclpy 节点订阅 sensor_msgs/BatteryState 话题，
+# 上报 percentage（电量百分比）和 power_supply_status（充电状态）。
+# 需要进程带有 ROS2 环境（如 service 中 source /opt/ros/humble/setup.bash）；
+# 非默认 DDS 域时在 service 里加 Environment=ROS_DOMAIN_ID=<id>。
+# 留空则禁用电池状态上报，App 侧显示 UNKNOWN。
+battery:
+  topic: /battery_state         # BatteryState 话题名
+
+# 网络状态（WiFi）上报，直接从内核读取：SSID 用 wireless extensions ioctl，
+# 信号强度读 /proc/net/wireless，IPv4 地址用 netifaces 库（无子进程调用）。
+# interface 留空则自动探测第一个无线网卡（wlan*）；没有无线网卡时该功能
+# 自动禁用，App 侧显示 UNKNOWN。
+network:
+  interface: ""                 # WiFi 接口名，如 wlan0；留空自动探测
+  poll_interval_secs: 5         # 轮询周期（秒）
+
+# CPU 使用率上报，周期读取 /proc/stat 并计算差分（无子进程调用）。
+# 首次采样只建立基线，首个读数约在一个轮询周期后产生（此前 App 侧为 UNKNOWN）。
+cpu:
+  poll_interval_secs: 5         # 轮询周期（秒）
+  notify_threshold: 1.0         # 变化达到多少个百分点才通知 App
+
+# 日志级别：trace/debug/info/warn/error
+log_level: info

@@ -1,0 +1,24 @@
+[Unit]
+Description=Xiaozhi BLE control bridge (BLE GATT -> xiaozhi control socket)
+After=network-online.target bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sunrise
+Group=sunrise
+# 移动模块目录后，修改下面三处路径为新的模块位置
+WorkingDirectory=/home/sunrise/xiaozhi-ws/xiaozhi-ble
+Environment=HOME=/home/sunrise
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# 默认读取 ~/.config/xiaozhi-ble/config.yaml；如需指定其他位置：
+# ExecStart=.../bin/xiaozhi-ble --config /path/to/config.yaml
+# 电量订阅需要 ROS2 环境（rclpy/sensor_msgs），这里先 source 再启动；
+# 使用非默认 DDS 域时再加一行：Environment=ROS_DOMAIN_ID=<id>
+ExecStartPre=+/bin/systemctl restart bluetooth.service
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec /home/sunrise/xiaozhi-ws/xiaozhi-ble/.venv/bin/xiaozhi-ble'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

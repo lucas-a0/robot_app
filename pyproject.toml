@@ -1,0 +1,27 @@
+[project]
+name = "xiaozhi-ble"
+version = "0.1.0"
+description = "BLE push-to-talk control bridge for the xiaozhi voice client"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dasbus>=1.7",
+    "loguru>=0.7",
+    "netifaces>=0.11.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+xiaozhi-ble = "xiaozhi_ble.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xiaozhi_ble"]
