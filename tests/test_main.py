@@ -51,6 +51,8 @@ def test_sync_websocket_url_publishes_current_url(tmp_path):
 
     assert bridge._client.requests == ["get_url"]
     assert bridge._server.urls == ["wss://robot.example.com/ws/robot"]
+    # The latency probe follows the effective dialogue-server URL.
+    assert bridge._latency_provider._target == ("robot.example.com", 443)
 
 
 def test_sync_websocket_url_tolerates_socket_failures(tmp_path):

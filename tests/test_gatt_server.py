@@ -1,6 +1,8 @@
 """Tests for the BLE push-to-talk GATT implementation."""
 
 from xiaozhi_ble.gatt_server import ADVERTISEMENT_PATH
+from xiaozhi_ble.gatt_server import BANDWIDTH_CHAR_UUID
+from xiaozhi_ble.gatt_server import BANDWIDTH_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHAR_UUID
 from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CCCD_UUID
@@ -10,10 +12,14 @@ from xiaozhi_ble.gatt_server import CPU_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import NETWORK_CHAR_UUID
 from xiaozhi_ble.gatt_server import NETWORK_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import BatteryStatusCharacteristic
+from xiaozhi_ble.gatt_server import BandwidthStatusCharacteristic
 from xiaozhi_ble.gatt_server import BleControlServer
 from xiaozhi_ble.gatt_server import BridgeError
 from xiaozhi_ble.gatt_server import ERROR_CHAR_UUID
 from xiaozhi_ble.gatt_server import ERROR_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import LATENCY_CHAR_UUID
+from xiaozhi_ble.gatt_server import LATENCY_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import LatencyStatusCharacteristic
 from xiaozhi_ble.gatt_server import URL_CHAR_UUID
 from xiaozhi_ble.gatt_server import URL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CommandCharacteristic
@@ -22,6 +28,9 @@ from xiaozhi_ble.gatt_server import CpuStatusCharacteristic
 from xiaozhi_ble.gatt_server import ErrorCharacteristic
 from xiaozhi_ble.gatt_server import GattApplication
 from xiaozhi_ble.gatt_server import NetworkStatusCharacteristic
+from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHAR_UUID
+from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import RobotControlCharacteristic
 from xiaozhi_ble.gatt_server import WebsocketUrlCharacteristic
 
 
@@ -223,6 +232,87 @@ def test_cpu_status_characteristic_formats_usage():
     assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
 
 
+def test_bandwidth_status_characteristic_formats_rates():
+    characteristic = BandwidthStatusCharacteristic()
+    assert characteristic.Flags == ["read", "notify"]
+    assert characteristic.Descriptors == [BANDWIDTH_CHARACTERISTIC_CCCD_PATH]
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
+
+    characteristic.update_bandwidth(1234.56, 56.78)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "BANDWIDTH 1234.6 56.8"
+
+    characteristic.update_bandwidth(None, None)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
+
+
+def test_latency_status_characteristic_formats_latency():
+    characteristic = LatencyStatusCharacteristic()
+    assert characteristic.Flags == ["read", "notify"]
+    assert characteristic.Descriptors == [LATENCY_CHARACTERISTIC_CCCD_PATH]
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
+
+    characteristic.update_latency(37.4)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "LATENCY 37"
+
+    # None means the server is unreachable, distinct from "no reading yet".
+    characteristic.update_latency(None)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "LATENCY -"
+
+
+def test_robot_control_characteristic_dispatches_commands():
+    calls = []
+
+    def callback(command: str) -> str | None:
+        calls.append(command)
+        return None
+
+    characteristic = RobotControlCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH]
+
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"  Stand_Up "), {})
+
+    # Accepted commands stay silent.
+    assert calls == ["stand_up"]
+    assert bytes(characteristic.Value) == b""
+
+    # An asynchronous failure is notified later.
+    characteristic.report_error("ERR failed stand_up low battery")
+    assert bytes(characteristic.Value).decode("utf-8") == (
+        "ERR failed stand_up low battery"
+    )
+
+
+def test_robot_control_characteristic_relays_immediate_errors():
+    def callback(command: str) -> str | None:
+        return "ERR command" if command == "dance" else "ERR unavailable"
+
+    characteristic = RobotControlCharacteristic(callback)
+    characteristic.StartNotify()
+
+    characteristic.WriteValue([0xff], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    characteristic.WriteValue(list(b"dance"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    characteristic.WriteValue(list(b"stand_up"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR unavailable"
+
+    def broken(command: str) -> str | None:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = RobotControlCharacteristic(broken)
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"stand_up"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_dbus_signatures_match_bluez_gatt_contract():
     characteristic_xml = CommandCharacteristic.__dbus_xml__
     application_xml = GattApplication.__dbus_xml__
@@ -237,6 +327,9 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert BATTERY_STATUS_CHAR_UUID in str(managed_objects)
     assert NETWORK_CHAR_UUID in str(managed_objects)
     assert CPU_CHAR_UUID in str(managed_objects)
+    assert BANDWIDTH_CHAR_UUID in str(managed_objects)
+    assert LATENCY_CHAR_UUID in str(managed_objects)
+    assert ROBOT_CONTROL_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )
@@ -250,6 +343,9 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert NETWORK_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert CPU_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert BANDWIDTH_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert LATENCY_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH in managed_objects
     command_char = _unpack_properties(
         managed_objects["/org/xiaozhi/ble_app/service0/char0"][
             "org.bluez.GattCharacteristic1"

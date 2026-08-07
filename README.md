@@ -4,7 +4,8 @@
 
 手机 App 通过 BLE GATT 实现"按住说话"（协议见 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)），
 本模块把 BLE 控制指令转发给对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket，
-并把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态回传给 App。
+把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态回传给 App，
+并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下）。
 
 ```text
 手机 App  <-- BLE GATT -->  xiaozhi-ble（本模块）  <-- Unix socket -->  xiaozhi 对话模块
@@ -16,14 +17,25 @@
   客户端断开后会延迟几秒主动重新注册广播，兜底部分适配器断连后不再
   恢复广播、导致重新扫描不到设备的问题。
 - `control_client.py`：Unix socket 客户端，自动重连，请求/响应匹配。
-- `battery.py`：电池状态获取，内置 rclpy 节点订阅 `sensor_msgs/BatteryState`
-  话题（默认 `/battery_state`），上报电量百分比和充电状态；ROS2 环境不可用时
-  自动禁用，不影响其余功能。
+- `battery.py`：电池状态获取，在共享 rclpy 节点上订阅
+  `sensor_msgs/BatteryState` 话题（默认 `/battery_state`），上报电量百分比和
+  充电状态；ROS2 环境不可用时自动禁用，不影响其余功能。
+- `ros_runtime.py`：共享 rclpy 运行时，持有进程级唯一的 rclpy 上下文、
+  节点（`xiaozhi_ble`）和 spin 线程；battery 和 robot_control 都挂载在这个
+  节点上，不各自创建上下文。
+- `robot_control.py`：机器人行为控制，把 App 写入的命令名按配置映射为
+  `std_srvs/Trigger` 服务并异步调用；成功静默，失败通过特征值 Notify 上报。
 - `network.py`：网络状态获取，直接从内核读取 WiFi 状态（SSID 用 wireless
   extensions ioctl，信号强度读 `/proc/net/wireless`，IPv4 地址用 netifaces 库），
   仅在状态变化时通知；没有无线网卡时自动禁用。
 - `cpu.py`：CPU 使用率获取，周期读取 `/proc/stat` 累计 tick 并计算差分，
   变化超过阈值才通知；启动后首个读数约在一个轮询周期后产生。
+- `bandwidth.py`：WiFi 带宽速率获取，周期读取 `/proc/net/dev` 的累计字节
+  计数并计算差分（rx/tx 各多少 KB/s），变化超过阈值才通知；没有无线网卡时
+  自动禁用。
+- `latency.py`：对话服务器延迟探测，按周期向 WebSocket 地址的主机发起
+  TCP 建连，以建连耗时近似 ping 延迟（无需 root 的 ICMP raw socket）；
+  服务器地址由控制 socket 同步推送，地址不可用时探测自动挂起。
 - `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
 - `config.py`：YAML 配置加载。
 
@@ -46,9 +58,10 @@ socket 断连时本模块向 App 上报 `ERROR VOICE_UNAVAILABLE`，重连后由
 
 ### 电池状态
 
-电池状态是本模块自己的功能，不经过对话模块。模块内嵌一个 rclpy 节点，订阅
-`battery.topic` 配置的 `sensor_msgs/BatteryState` 话题（默认 `/battery_state`，
-QoS 用 sensor data/best-effort，兼容可靠与尽力发布的驱动），收到消息即更新缓存值。
+电池状态是本模块自己的功能，不经过对话模块。模块在共享 rclpy 节点（见
+`ros_runtime.py`）上订阅 `battery.topic` 配置的 `sensor_msgs/BatteryState` 话题
+（默认 `/battery_state`，QoS 用 sensor data/best-effort，兼容可靠与尽力发布的
+驱动），收到消息即更新缓存值。
 消息中 `percentage` 为 NaN（无读数）时保留上一次值；`power_supply_status` 映射为
 `CHARGING` / `DISCHARGING` / `NOT_CHARGING` / `FULL` 上报给 App。`battery.topic`
 留空则禁用，App 侧显示 `UNKNOWN`。GATT 特征值仍按 1 秒周期向 App 重发缓存值。
@@ -94,6 +107,61 @@ App，避免抖动导致频繁推送。
 cpu:
   poll_interval_secs: 5
   notify_threshold: 1.0
+```
+
+### WiFi 带宽速率
+
+带宽速率同样是本模块自己的功能。模块按 `bandwidth.poll_interval_secs`
+（默认 5 秒）周期读取 `/proc/net/dev` 中网卡的累计收发字节，计算相邻两次
+采样的差分得到上下行速率（KB/s，无子进程调用）。监控的网卡与网络状态
+一致（`network.interface`，留空自动探测）；没有无线网卡时自动禁用，App 侧
+显示 `UNKNOWN`。首次采样只建立基线；仅当 rx 或 tx 变化达到
+`bandwidth.notify_threshold`（默认 10 KB/s）时才通知 App。
+
+配置示例：
+
+```yaml
+bandwidth:
+  poll_interval_secs: 5
+  notify_threshold: 10.0
+```
+
+### 对话服务器延迟
+
+延迟探测同样是本模块自己的功能。模块从控制 socket 同步当前生效的
+WebSocket 地址，按 `latency.poll_interval_secs`（默认 5 秒）周期向其主机
+发起 TCP 建连，以建连耗时近似 ping 延迟（不需要 root 的 ICMP raw socket，
+无子进程调用）。尚未同步到地址时探测挂起，App 侧显示 `UNKNOWN`；服务器
+不可达时上报 `LATENCY -`。仅当延迟变化达到
+`latency.notify_threshold_ms`（默认 10 毫秒）或可达性变化时才通知 App。
+
+配置示例：
+
+```yaml
+latency:
+  poll_interval_secs: 5
+  notify_threshold_ms: 10.0
+  connect_timeout_secs: 2.0
+```
+
+### 机器人行为控制
+
+行为控制同样是本模块自己的功能。App 向 Robot Control 特征值写入命令名（如
+`stand_up`），模块按 `robot_control.commands` 配置的“命令名 → ROS2 服务”映射，
+在共享 rclpy 节点上异步调用对应的 `std_srvs/Trigger` 服务（服务类型固定为
+Trigger，映射只需写服务名）。命令执行成功完全静默；失败（命令不存在、服务
+不在线、`success=false`、调用超时）通过特征值 Notify 上报 `ERR ...`。
+需要 ROS2 环境（同电池状态）；`commands` 留空则禁用，写入任何命令都会收到
+`ERR unavailable`。
+
+配置示例：
+
+```yaml
+robot_control:
+  call_timeout_secs: 10.0    # 单次服务调用超时，超时按失败上报
+  commands:
+    stand_up: /base_bridge/stand_up
+    lie_down: /base_bridge/lie_down
 ```
 
 ## 依赖安装

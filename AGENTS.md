@@ -18,17 +18,23 @@
 1. **内核接口直接读**：`/proc/stat`（CPU）、`/proc/net/wireless`（信号强度）、
    ioctl（如 `SIOCGIWESSID` 取 SSID）。
 2. **成熟库**：netifaces（IP 地址）、dasbus（BlueZ D-Bus）。
-3. **订阅而非轮询**：ROS2 数据用内置 rclpy 节点订阅话题（见 `battery.py`），
-   不要 shell 出 `ros2` CLI。
+3. **订阅/调用而非轮询**：ROS2 数据用内置 rclpy 节点订阅话题或调用服务
+   （见 `battery.py` / `robot_control.py`），不要 shell 出 `ros2` CLI。
+   rclpy 的 init/shutdown 是进程级全局的，上下文、节点和 spin 线程统一由
+   `ros_runtime.py` 持有；ROS 相关模块只往共享节点上挂 subscription/client，
+   不得各自 `rclpy.init()` 或 `rclpy.shutdown()`。
 
 新增数据源前，先确认有没有上面三类途径；实在没有（确需外部命令）时，先在
 讨论中说明理由再实现。
 
 ## 2. Provider 模式（数据采集模块）
 
-`battery.py` / `network.py` / `cpu.py` 遵循同一套模式，新增数据源时请照抄：
+`network.py` / `cpu.py` / `bandwidth.py` / `latency.py` 遵循同一套模式，新增
+数据源时请照抄：
 
 - 独立线程 + `threading.Event` 停止信号；`start()` 幂等、`stop(timeout)` 可join。
+  例外：ROS 相关模块（`battery.py` 订阅、`robot_control.py` 服务调用）不自带
+  线程，`start(node)` 挂载到共享 runtime 节点上，由 runtime 的 spin 线程驱动。
 - **优雅降级**：依赖缺失时（rclpy 不可导入、没有无线网卡、`/proc` 文件不存在）
   `enabled` 为 False，`start()` 打日志后直接返回，不影响桥接其余功能；
   对应 GATT 特征值保持 `UNKNOWN`。

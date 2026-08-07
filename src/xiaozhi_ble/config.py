@@ -101,5 +101,88 @@ class BridgeConfig:
         return 1.0
 
     @property
+    def bandwidth_poll_interval_secs(self) -> float:
+        try:
+            value = self._get_nested("bandwidth.poll_interval_secs")
+        except KeyError:
+            return 5.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 5.0
+
+    @property
+    def bandwidth_notify_threshold(self) -> float:
+        """Minimum throughput change (KB/s) that triggers a notify."""
+        try:
+            value = self._get_nested("bandwidth.notify_threshold")
+        except KeyError:
+            return 10.0
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+        return 10.0
+
+    @property
+    def latency_poll_interval_secs(self) -> float:
+        try:
+            value = self._get_nested("latency.poll_interval_secs")
+        except KeyError:
+            return 5.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 5.0
+
+    @property
+    def latency_notify_threshold_ms(self) -> float:
+        """Minimum latency change (milliseconds) that triggers a notify."""
+        try:
+            value = self._get_nested("latency.notify_threshold_ms")
+        except KeyError:
+            return 10.0
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+        return 10.0
+
+    @property
+    def latency_connect_timeout_secs(self) -> float:
+        try:
+            value = self._get_nested("latency.connect_timeout_secs")
+        except KeyError:
+            return 2.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 2.0
+
+    @property
+    def robot_control_commands(self) -> dict[str, str]:
+        """BLE robot-control command name -> ROS2 Trigger service mapping."""
+        try:
+            value = self._get_nested("robot_control.commands")
+        except KeyError:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        commands = {}
+        for name, service in value.items():
+            if isinstance(name, str) and isinstance(service, str) and service.startswith("/"):
+                commands[name.strip().lower()] = service
+            else:
+                print(
+                    f"Ignoring invalid robot_control.commands entry: "
+                    f"{name!r} -> {service!r}",
+                    flush=True,
+                )
+        return commands
+
+    @property
+    def robot_control_call_timeout_secs(self) -> float:
+        try:
+            value = self._get_nested("robot_control.call_timeout_secs")
+        except KeyError:
+            return 10.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 10.0
+
+    @property
     def log_level(self) -> str:
         return self._str("log_level", "info")

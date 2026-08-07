@@ -21,11 +21,15 @@ import threading
 from loguru import logger
 
 from .battery import BatteryProvider
+from .bandwidth import BandwidthProvider
 from .config import BridgeConfig
 from .control_client import ControlClient, ControlRequestError, ControlUnavailable
 from .cpu import CpuProvider
 from .gatt_server import BleControlServer, BridgeError
+from .latency import LatencyProvider
 from .network import NetworkProvider
+from .robot_control import RobotControl
+from .ros_runtime import RosRuntime
 
 
 class _Bridge:
@@ -42,18 +46,28 @@ class _Bridge:
             initial_url="",
             initial_error=("VOICE_UNAVAILABLE", "control socket is not connected"),
             initial_battery_status=(None, None),
+            robot_control_callback=self._handle_robot_command,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
             on_notification=self._handle_notification,
             on_connection_change=self._handle_connection_change,
         )
-        # Battery is a bridge-local concern: the conversation module knows
-        # nothing about it. A small rclpy node subscribes to the configured
-        # BatteryState topic instead of shelling out to `ros2 topic echo`.
+        # Battery and robot control share one rclpy node owned by the ROS
+        # runtime (rclpy init/shutdown are process-global); both attach to
+        # its node instead of creating their own contexts.
+        self._ros_runtime = RosRuntime()
         self._battery_provider = BatteryProvider(
             topic=config.battery_topic,
             on_status=self._server.notify_battery_status,
+        )
+        # Robot control is also bridge-local: BLE command names map to
+        # std_srvs/Trigger services from configuration; success stays
+        # silent, failures come back through notify_robot_control_error.
+        self._robot_control = RobotControl(
+            commands=config.robot_control_commands,
+            call_timeout_secs=config.robot_control_call_timeout_secs,
+            on_error=self._server.notify_robot_control_error,
         )
         # Network status is also bridge-local: read the WiFi link from the
         # kernel (ioctl + /proc/net/wireless + netifaces), no subprocesses.
@@ -68,13 +82,37 @@ class _Bridge:
             poll_interval_secs=config.cpu_poll_interval_secs,
             notify_threshold=config.cpu_notify_threshold,
         )
+        # WiFi throughput: /proc/net/dev byte-counter deltas on the same
+        # interface as the network provider.
+        self._bandwidth_provider = BandwidthProvider(
+            on_bandwidth=self._server.notify_bandwidth,
+            interface=config.network_interface,
+            poll_interval_secs=config.bandwidth_poll_interval_secs,
+            notify_threshold=config.bandwidth_notify_threshold,
+        )
+        # Dialogue-server latency: TCP connect time against the effective
+        # WebSocket URL pushed from the control socket (see _publish_url).
+        self._latency_provider = LatencyProvider(
+            on_latency=self._server.notify_latency,
+            poll_interval_secs=config.latency_poll_interval_secs,
+            notify_threshold_ms=config.latency_notify_threshold_ms,
+            connect_timeout_secs=config.latency_connect_timeout_secs,
+        )
 
     def start(self) -> bool:
         assert self._client is not None
         self._client.start()
-        self._battery_provider.start()
+        # The shared rclpy node only comes up when a ROS-backed feature is
+        # configured; without a ROS2 environment both stay disabled.
+        if self._battery_provider.enabled or self._robot_control.enabled:
+            if self._ros_runtime.start():
+                node = self._ros_runtime.node
+                self._battery_provider.start(node)
+                self._robot_control.start(node)
         self._network_provider.start()
         self._cpu_provider.start()
+        self._bandwidth_provider.start()
+        self._latency_provider.start()
         if self._server.start():
             # The client may have connected before the GATT server was up, in
             # which case the "connected" callback was dropped; sync the error
@@ -84,9 +122,13 @@ class _Bridge:
                 self._sync_websocket_url()
             return True
         logger.error(f"Failed to start BLE control: {self._server.error}")
+        self._latency_provider.stop()
+        self._bandwidth_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
+        self._robot_control.stop()
         self._battery_provider.stop()
+        self._ros_runtime.stop()
         self._client.stop()
         return False
 
@@ -95,10 +137,20 @@ class _Bridge:
         # Stop the GATT server first: its shutdown releases an outstanding
         # push-to-talk press, which needs the client to still be up.
         self._server.stop()
+        self._latency_provider.stop()
+        self._bandwidth_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
+        # Detach the ROS-backed features before shutting down the shared
+        # rclpy context they run on.
+        self._robot_control.stop()
         self._battery_provider.stop()
+        self._ros_runtime.stop()
         self._client.stop()
+
+    def _handle_robot_command(self, command: str) -> str | None:
+        """Dispatch a robot-control command; an error text is relayed to the App."""
+        return self._robot_control.execute(command)
 
     def _handle_command(self, command: str, reason: str) -> str:
         """Forward a start/stop command; the return value is relayed to the App."""
@@ -123,7 +175,7 @@ class _Bridge:
         if line.startswith("STATE "):
             self._server.notify_state(line[len("STATE "):])
         elif line.startswith("URL "):
-            self._server.notify_websocket_url(line[len("URL "):])
+            self._publish_websocket_url(line[len("URL "):])
         elif line == "NONE":
             self._server.notify_error("NONE", "")
         elif line.startswith("ERROR "):
@@ -153,6 +205,11 @@ class _Bridge:
                 "control socket is not connected",
             )
 
+    def _publish_websocket_url(self, url: str) -> None:
+        """Publish the effective URL over BLE and retarget the latency probe."""
+        self._server.notify_websocket_url(url)
+        self._latency_provider.set_url(url)
+
     def _sync_websocket_url(self) -> None:
         """Query the effective WebSocket URL and publish it over BLE.
 
@@ -169,7 +226,7 @@ class _Bridge:
             return
         parts = response.split(" ", 2)
         if len(parts) == 3 and parts[1] == "url" and parts[2]:
-            self._server.notify_websocket_url(parts[2])
+            self._publish_websocket_url(parts[2])
         else:
             logger.warning(f"Unexpected get_url response: {response!r}")
 
