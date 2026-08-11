@@ -17,6 +17,8 @@ from dasbus.typing import Bool, Byte, Dict, List, ObjPath, Str, Variant
 from gi.repository import GLib
 from loguru import logger
 
+from .wifi_config import WifiRequestError, parse_wifi_request
+
 
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 COMMAND_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
@@ -28,6 +30,7 @@ CPU_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef6"
 BANDWIDTH_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef7"
 LATENCY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef8"
 ROBOT_CONTROL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef9"
+WIFI_CONFIG_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefa"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
@@ -42,6 +45,7 @@ CPU_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char5"
 BANDWIDTH_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char6"
 LATENCY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char7"
 ROBOT_CONTROL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char8"
+WIFI_CONFIG_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char9"
 CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
 URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
 ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
@@ -53,6 +57,7 @@ CPU_CHARACTERISTIC_CCCD_PATH = f"{CPU_CHARACTERISTIC_PATH}/desc0"
 BANDWIDTH_CHARACTERISTIC_CCCD_PATH = f"{BANDWIDTH_CHARACTERISTIC_PATH}/desc0"
 LATENCY_CHARACTERISTIC_CCCD_PATH = f"{LATENCY_CHARACTERISTIC_PATH}/desc0"
 ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH = f"{ROBOT_CONTROL_CHARACTERISTIC_PATH}/desc0"
+WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH = f"{WIFI_CONFIG_CHARACTERISTIC_PATH}/desc0"
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
 # Receives (command, reason), returns the response text relayed to the App,
@@ -64,6 +69,10 @@ ErrorCallback = Callable[[str, str], None]
 # App (e.g. "ERR command"), or None when the command was dispatched and its
 # result is reported asynchronously.
 RobotControlCallback = Callable[[str], str | None]
+# Receives (ssid, password), returns an immediate error text relayed to the
+# App (e.g. "ERR busy"), or None when the request was accepted and its result
+# is reported asynchronously ("CONNECTED ..." / "FAILED ...").
+WifiConfigCallback = Callable[[str, str], str | None]
 
 
 class BridgeError(Exception):
@@ -801,6 +810,96 @@ class RobotControlCharacteristic(InterfaceTemplate):
         logger.debug(f"Sent BLE robot-control notification: {text!r}")
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class WifiConfigCharacteristic(InterfaceTemplate):
+    """Receive WiFi provisioning requests and notify progress and results."""
+
+    def __init__(self, callback: WifiConfigCallback) -> None:
+        super().__init__(self)
+        self._callback = callback
+        self._flags = ["read", "write", "notify"]
+        self._notifying = False
+        self._value: List[Byte] = []
+
+    @property
+    def UUID(self) -> Str:
+        return WIFI_CONFIG_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        """Return the most recently published progress or result."""
+        return _read_bytes(self._value, options)
+
+    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
+        """Handle a UTF-8 "<ssid>\n<password>" provisioning request."""
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            self._notify("ERR encoding")
+            return
+
+        try:
+            ssid, password = parse_wifi_request(text)
+        except WifiRequestError as exc:
+            logger.warning(f"Invalid BLE WiFi config request: {exc}")
+            self._notify("ERR invalid")
+            return
+
+        # Never log the password.
+        logger.info(f"Received BLE WiFi config request: ssid={ssid!r}")
+        try:
+            error = self._callback(ssid, password)
+        except Exception:
+            logger.exception("Failed to dispatch BLE WiFi config request")
+            self._notify("ERR internal")
+            return
+        if error is not None:
+            self._notify(error)
+            return
+        self._notify(f"CONNECTING {ssid}")
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def report_result(self, text: str) -> None:
+        """Publish the asynchronous provisioning result."""
+        self._notify(text)
+
+    def _notify(self, text: str) -> None:
+        data = list(_bounded_text(text).encode("utf-8"))
+        self._value = data
+        if not self._notifying:
+            return
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", data)},
+                [],
+            )
+        except Exception:
+            logger.exception(f"Failed to emit BLE WiFi config notification: {text!r}")
+            return
+        logger.debug(f"Sent BLE WiFi config notification: {text!r}")
+
+
 @dbus_interface("org.bluez.GattDescriptor1")
 class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
     """Expose the standard descriptor clients write to enable notifications."""
@@ -873,6 +972,7 @@ class ControlService(InterfaceTemplate):
             BANDWIDTH_CHARACTERISTIC_PATH,
             LATENCY_CHARACTERISTIC_PATH,
             ROBOT_CONTROL_CHARACTERISTIC_PATH,
+            WIFI_CONFIG_CHARACTERISTIC_PATH,
         ]
 
 
@@ -943,6 +1043,7 @@ class GattApplication(InterfaceTemplate):
                             BANDWIDTH_CHARACTERISTIC_PATH,
                             LATENCY_CHARACTERISTIC_PATH,
                             ROBOT_CONTROL_CHARACTERISTIC_PATH,
+                            WIFI_CONFIG_CHARACTERISTIC_PATH,
                         ],
                     ),
                 }
@@ -1030,6 +1131,16 @@ class GattApplication(InterfaceTemplate):
                     ),
                 }
             },
+            WIFI_CONFIG_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", WIFI_CONFIG_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "write", "notify"]),
+                    "Descriptors": Variant(
+                        "ao", [WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH]
+                    ),
+                }
+            },
             CHARACTERISTIC_CCCD_PATH: {
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
@@ -1093,6 +1204,13 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
+            WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", WIFI_CONFIG_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
         }
 
 
@@ -1110,11 +1228,15 @@ class BleControlServer:
         initial_battery_status: tuple[float | None, str | None] = (None, None),
         url_callback: UrlCallback | None = None,
         robot_control_callback: RobotControlCallback | None = None,
+        wifi_config_callback: WifiConfigCallback | None = None,
     ) -> None:
         self._callback = callback
         self._url_callback = url_callback or (lambda _url: None)
         self._robot_control_callback = robot_control_callback or (
             lambda _command: "ERR unavailable"
+        )
+        self._wifi_config_callback = wifi_config_callback or (
+            lambda _ssid, _password: "ERR unavailable"
         )
         self._adapter_path = adapter_path
         self._device_name = device_name
@@ -1144,6 +1266,7 @@ class BleControlServer:
         self._bandwidth_characteristic: BandwidthStatusCharacteristic | None = None
         self._latency_characteristic: LatencyStatusCharacteristic | None = None
         self._robot_control_characteristic: RobotControlCharacteristic | None = None
+        self._wifi_config_characteristic: WifiConfigCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1301,6 +1424,18 @@ class BleControlServer:
 
         GLib.idle_add(update)
 
+    def notify_wifi_config_result(self, text: str) -> None:
+        """Publish an asynchronous WiFi provisioning result from any thread."""
+        if self._wifi_config_characteristic is None:
+            return
+
+        def update() -> bool:
+            if self._wifi_config_characteristic is not None:
+                self._wifi_config_characteristic.report_result(text)
+            return False
+
+        GLib.idle_add(update)
+
     def _run(self) -> None:
         try:
             self._bus = SystemMessageBus()
@@ -1325,6 +1460,9 @@ class BleControlServer:
             self._latency_characteristic = LatencyStatusCharacteristic()
             self._robot_control_characteristic = RobotControlCharacteristic(
                 self._robot_control_callback
+            )
+            self._wifi_config_characteristic = WifiConfigCharacteristic(
+                self._wifi_config_callback
             )
             command_cccd = ClientCharacteristicConfigurationDescriptor(
                 CHARACTERISTIC_PATH,
@@ -1370,6 +1508,11 @@ class BleControlServer:
                 ROBOT_CONTROL_CHARACTERISTIC_PATH,
                 self._robot_control_characteristic.StartNotify,
                 self._robot_control_characteristic.StopNotify,
+            )
+            wifi_config_cccd = ClientCharacteristicConfigurationDescriptor(
+                WIFI_CONFIG_CHARACTERISTIC_PATH,
+                self._wifi_config_characteristic.StartNotify,
+                self._wifi_config_characteristic.StopNotify,
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -1422,6 +1565,13 @@ class BleControlServer:
             )
             self._bus.publish_object(
                 ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH, robot_control_cccd
+            )
+            self._bus.publish_object(
+                WIFI_CONFIG_CHARACTERISTIC_PATH,
+                self._wifi_config_characteristic,
+            )
+            self._bus.publish_object(
+                WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH, wifi_config_cccd
             )
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)

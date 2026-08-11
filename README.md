@@ -36,6 +36,9 @@
 - `latency.py`：对话服务器延迟探测，按周期向 WebSocket 地址的主机发起
   TCP 建连，以建连耗时近似 ping 延迟（无需 root 的 ICMP raw socket）；
   服务器地址由控制 socket 同步推送，地址不可用时探测自动挂起。
+- `wifi_config.py`：WiFi 配网，把 App 写入的 SSID/密码通过 NetworkManager
+  D-Bus 接口创建并激活连接（固定连接名 `xiaozhi-ble`），结果异步回调上报；
+  NetworkManager 或无线网卡不可用时自动降级。
 - `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
 - `config.py`：YAML 配置加载。
 
@@ -144,7 +147,24 @@ latency:
   connect_timeout_secs: 2.0
 ```
 
-### 机器人行为控制
+### WiFi 配网
+
+WiFi 配网同样是本模块自己的功能。App 向 WiFi Config 特征值写入
+`<ssid>\n<password>` 两行文本（第二行为空或省略表示开放网络），模块通过
+NetworkManager D-Bus 接口（dasbus，无子进程调用）创建并激活 WiFi 连接：
+先删除同名的旧配置（固定连接名 `xiaozhi-ble`，保证密码更新生效），再
+`AddAndActivateConnection` 并轮询设备状态直到激活、失败或超时。受理后
+立即应答 `CONNECTING <ssid>`，最终结果（`CONNECTED <ssid>` /
+`FAILED <code> <ssid>`，`code` 为 `auth`/`not_found`/`timeout`/`failed`）
+通过特征值 Notify 异步上报；同时只允许一次配网，进行中写入收到 `ERR busy`。
+需要系统运行 NetworkManager 且存在无线网卡，否则写入收到 `ERR unavailable`。
+
+配置示例：
+
+```yaml
+wifi:
+  connect_timeout_secs: 30.0   # 单次配网最长等待时间，超时按 FAILED timeout 上报
+```
 
 行为控制同样是本模块自己的功能。App 向 Robot Control 特征值写入命令名（如
 `stand_up`），模块按 `robot_control.commands` 配置的“命令名 → ROS2 服务”映射，

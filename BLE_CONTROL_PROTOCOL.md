@@ -3,7 +3,7 @@
 本文档定义手机 App 与小智机器人之间的 BLE（Bluetooth Low Energy）控制协议。
 协议用于实现与 Web 页面相同的“按住说话”行为：按钮按下开始收音，按钮松开结束收音。
 
-协议版本：`1.5`
+协议版本：`1.6`
 
 ## 1. 适用范围
 
@@ -31,6 +31,7 @@ Service 内的特征值按功能分为四类，UUID 均为 `12345678-1234-5678-1
 | 状态监测 | Bandwidth Status Characteristic | `abcdef7` | Read、Notify |
 | 状态监测 | Latency Status Characteristic | `abcdef8` | Read、Notify |
 | 行为控制 | Robot Control Characteristic | `abcdef9` | Read、Write、Notify |
+| 连接配置 | WiFi Config Characteristic | `abcdefa` | Read、Write、Notify |
 
 广播名称可在机器人侧配置修改。App 应以 Service UUID 识别设备，不应只依赖广播名称。
 
@@ -44,7 +45,8 @@ Service 内的特征值按功能分为四类，UUID 均为 `12345678-1234-5678-1
 - App 应优先使用 GATT Write With Response，确认写入已被 BLE 协议栈接收。
 - 状态监测类特征值在数据尚未获取到时统一报 `UNKNOWN`；字段级缺失用占位符（如 `-`）。
 - 各特征值的具体文本格式见对应章节：Command 见第 4 节，WebSocket URL 见第 5 节，
-  Error 见第 6 节，状态监测各特征值见第 7 节，Robot Control 见第 8 节。
+  Error 见第 6 节，状态监测各特征值见第 7 节，Robot Control 见第 8 节，
+  WiFi Config 见第 9 节。
 
 ## 4. 语音控制（按住说话）
 
@@ -306,7 +308,69 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 命令，否则可能收不到错误通知。`ERR failed`/`ERR timeout` 中的 `<command>` 为机器人
 实际执行的命令名（已规范化），便于 App 区分并发命令的结果。
 
-## 9. 连接约束
+## 9. WiFi 配网（WiFi Config）
+
+App 可以向 WiFi Config 特征值写入目标 WiFi 的 SSID 和密码，机器人通过本机网络管理器
+（NetworkManager）连接指定 WiFi，并把连接结果通过 Notify 异步上报。机器人侧保存该
+WiFi 配置（固定连接名 `xiaozhi-ble`），重启网络后按系统策略自动重连。
+
+### 9.1 写入格式（App → 机器人）
+
+写入内容为 UTF-8 文本两行，以单个换行符 `\n` 分隔：
+
+```text
+<ssid>\n<password>
+```
+
+- 第一行为 SSID，整行即 SSID（SSID 可能包含空格）；不能为空，按 IEEE 802.11 上限
+  不超过 32 字节。
+- 第二行为密码；空行或省略第二行均表示连接开放（无密码）网络。WPA/WPA2 密码为
+  8-63 个字符。
+- 尾部换行可选；机器人解析时会去除各行首尾空白。
+- 写入总长不超过 180 字节；App 应在写入前协商至少 183 字节的 ATT MTU（同 URL 特征值）。
+
+### 9.2 应答与结果（机器人 → App）
+
+App 必须先订阅 WiFi Config 特征值的 Notify 再写入，否则可能收不到结果通知。连接
+通常需要数秒到数十秒，应答与结果分两条通知：
+
+| 通知内容 | 含义 |
+|---|---|
+| `CONNECTING <ssid>` | 写入校验通过，机器人已开始连接（**即时应答，不代表连接成功**） |
+| `CONNECTED <ssid>` | 连接成功（已关联 AP 并获取到 IP 地址） |
+| `FAILED auth <ssid>` | 密码错误或鉴权失败 |
+| `FAILED not_found <ssid>` | 找不到该 AP（SSID 不在覆盖范围或拼写错误） |
+| `FAILED timeout <ssid>` | 超过机器人侧配置的超时时间（默认 30 秒）仍未完成连接 |
+| `FAILED failed <ssid>` | 其他原因导致的连接失败 |
+
+写入不合法或机器人当前无法受理时，即时回复错误（不会有后续 `CONNECTED`/`FAILED`）：
+
+| 通知内容 | 含义 |
+|---|---|
+| `ERR encoding` | 写入内容不是合法 UTF-8 |
+| `ERR invalid` | 格式不符（SSID 为空或超长、密码长度非法） |
+| `ERR busy` | 上一次配网仍在进行中；机器人同时只处理一次配网 |
+| `ERR unavailable` | 配网功能不可用（无 NetworkManager 或没有无线网卡） |
+
+`ssid` 一律为通知的最后一个字段，可能包含空格；App 解析时先取前面的固定字段，
+其余部分作为 SSID。读取该特征值返回最近一次通知文本（尚无通知时为空）。
+
+连接过程中机器人的 Network Status 特征值会先变为 `DISCONNECTED`、成功后再变为
+`WIFI ...`（新 SSID）；App 判断本次配网成败应以 WiFi Config 的结果通知为准。
+
+### 9.3 标准交互时序
+
+```text
+App                                      Robot
+ |---- Subscribe WiFi Config Notify ---->|
+ |---- Write "MyHome\n12345678" -------->|
+ |<------------------ CONNECTING MyHome --|
+ |              （机器人切换 WiFi 中）     |
+ |<------------------- CONNECTED MyHome --|
+ |<--- Network Status: WIFI -42 ... MyHome|  由状态监测特征值另行上报
+```
+
+## 10. 连接约束
 
 - 当前版本按单个控制 App 设计，不支持多个 App 同时争用按住说话控制权。
 - 当前版本不定义应用层鉴权、加密载荷或强制 BLE 配对；连接安全由内部测试环境负责。
@@ -314,7 +378,7 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 - App 应设置合理的连接和写入超时。一次写入失败时，应将按钮恢复为未按下状态；若连接仍然
   有效，可以补发一次 `stop`，但不应自动重试 `start`。
 
-## 10. App 实现检查表
+## 11. App 实现检查表
 
 语音控制：
 
@@ -346,3 +410,10 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 
 15. 使用机器人行为控制时，先订阅 Robot Control 特征值的 Notify 再写入命令；
     成功无通知，收到 `ERR ...` 时按错误码提示用户。
+
+WiFi 配网：
+
+16. 配网前先订阅 WiFi Config 特征值的 Notify，写入前协商足够的 MTU。
+17. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
+    以 `CONNECTED`/`FAILED` 为准更新界面，不要依据 `CONNECTING` 假定连接成功。
+18. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。

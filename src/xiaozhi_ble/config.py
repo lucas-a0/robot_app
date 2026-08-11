@@ -184,5 +184,16 @@ class BridgeConfig:
         return 10.0
 
     @property
+    def wifi_connect_timeout_secs(self) -> float:
+        """Maximum time to wait for a WiFi provisioning attempt to finish."""
+        try:
+            value = self._get_nested("wifi.connect_timeout_secs")
+        except KeyError:
+            return 30.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 30.0
+
+    @property
     def log_level(self) -> str:
         return self._str("log_level", "info")

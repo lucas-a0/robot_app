@@ -30,6 +30,7 @@ from .latency import LatencyProvider
 from .network import NetworkProvider
 from .robot_control import RobotControl
 from .ros_runtime import RosRuntime
+from .wifi_config import WifiConfigurator
 
 
 class _Bridge:
@@ -47,6 +48,7 @@ class _Bridge:
             initial_error=("VOICE_UNAVAILABLE", "control socket is not connected"),
             initial_battery_status=(None, None),
             robot_control_callback=self._handle_robot_command,
+            wifi_config_callback=self._handle_wifi_config,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
@@ -97,6 +99,13 @@ class _Bridge:
             poll_interval_secs=config.latency_poll_interval_secs,
             notify_threshold_ms=config.latency_notify_threshold_ms,
             connect_timeout_secs=config.latency_connect_timeout_secs,
+        )
+        # WiFi provisioning: NetworkManager over D-Bus (dasbus, no
+        # subprocesses), one attempt at a time; the result comes back
+        # asynchronously through _publish_wifi_result.
+        self._wifi_configurator = WifiConfigurator(
+            on_result=self._publish_wifi_result,
+            connect_timeout_secs=config.wifi_connect_timeout_secs,
         )
 
     def start(self) -> bool:
@@ -151,6 +160,18 @@ class _Bridge:
     def _handle_robot_command(self, command: str) -> str | None:
         """Dispatch a robot-control command; an error text is relayed to the App."""
         return self._robot_control.execute(command)
+
+    def _handle_wifi_config(self, ssid: str, password: str) -> str | None:
+        """Dispatch a WiFi provisioning request; an error text is relayed to the App."""
+        error = self._wifi_configurator.connect(ssid, password)
+        return f"ERR {error}" if error is not None else None
+
+    def _publish_wifi_result(self, code: str, ssid: str) -> None:
+        """Relay the asynchronous provisioning outcome to the App."""
+        if code == "connected":
+            self._server.notify_wifi_config_result(f"CONNECTED {ssid}")
+        else:
+            self._server.notify_wifi_config_result(f"FAILED {code} {ssid}")
 
     def _handle_command(self, command: str, reason: str) -> str:
         """Forward a start/stop command; the return value is relayed to the App."""

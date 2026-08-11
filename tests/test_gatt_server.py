@@ -22,6 +22,9 @@ from xiaozhi_ble.gatt_server import LATENCY_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import LatencyStatusCharacteristic
 from xiaozhi_ble.gatt_server import URL_CHAR_UUID
 from xiaozhi_ble.gatt_server import URL_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import WIFI_CONFIG_CHAR_UUID
+from xiaozhi_ble.gatt_server import WifiConfigCharacteristic
 from xiaozhi_ble.gatt_server import CommandCharacteristic
 from xiaozhi_ble.gatt_server import ControlAdvertisement
 from xiaozhi_ble.gatt_server import CpuStatusCharacteristic
@@ -313,6 +316,69 @@ def test_robot_control_characteristic_relays_immediate_errors():
     assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
 
 
+def test_wifi_config_characteristic_dispatches_requests():
+    calls = []
+
+    def callback(ssid: str, password: str) -> str | None:
+        calls.append((ssid, password))
+        return None
+
+    characteristic = WifiConfigCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH]
+
+    characteristic.StartNotify()
+    characteristic.WriteValue(list("MyHome\n12345678".encode("utf-8")), {})
+
+    # Accepted requests get an immediate CONNECTING acknowledgement.
+    assert calls == [("MyHome", "12345678")]
+    assert bytes(characteristic.Value).decode("utf-8") == "CONNECTING MyHome"
+
+    # An empty/omitted password line means an open network.
+    characteristic.WriteValue(list(b"Open AP\n"), {})
+    assert calls[-1] == ("Open AP", "")
+    assert bytes(characteristic.Value).decode("utf-8") == "CONNECTING Open AP"
+
+    # The asynchronous result replaces the cached value.
+    characteristic.report_result("CONNECTED MyHome")
+    assert bytes(characteristic.Value).decode("utf-8") == "CONNECTED MyHome"
+
+
+def test_wifi_config_characteristic_relays_immediate_errors():
+    def callback(ssid: str, password: str) -> str | None:
+        return "ERR busy" if ssid == "MyHome" else "ERR unavailable"
+
+    characteristic = WifiConfigCharacteristic(callback)
+    characteristic.StartNotify()
+
+    characteristic.WriteValue([0xff], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    # Empty SSID, oversized SSID and short passwords are rejected locally.
+    characteristic.WriteValue(list(b"\n12345678"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR invalid"
+
+    characteristic.WriteValue(list(f"{'x' * 33}\n12345678".encode()), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR invalid"
+
+    characteristic.WriteValue(list(b"MyHome\n123"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR invalid"
+
+    characteristic.WriteValue(list(b"MyHome\n12345678"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR busy"
+
+    characteristic.WriteValue(list(b"OtherAP\n12345678"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR unavailable"
+
+    def broken(ssid: str, password: str) -> str | None:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = WifiConfigCharacteristic(broken)
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"MyHome\n12345678"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_dbus_signatures_match_bluez_gatt_contract():
     characteristic_xml = CommandCharacteristic.__dbus_xml__
     application_xml = GattApplication.__dbus_xml__
@@ -330,6 +396,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert BANDWIDTH_CHAR_UUID in str(managed_objects)
     assert LATENCY_CHAR_UUID in str(managed_objects)
     assert ROBOT_CONTROL_CHAR_UUID in str(managed_objects)
+    assert WIFI_CONFIG_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )
@@ -346,6 +413,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert BANDWIDTH_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert LATENCY_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH in managed_objects
     command_char = _unpack_properties(
         managed_objects["/org/xiaozhi/ble_app/service0/char0"][
             "org.bluez.GattCharacteristic1"

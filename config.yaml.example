@@ -59,5 +59,13 @@ robot_control:
     stand_up: /base_bridge/stand_up
     lie_down: /base_bridge/lie_down
 
+# WiFi 配网：App 向 WiFi Config 特征值写入 "<ssid>\n<password>"，本模块通过
+# NetworkManager D-Bus 接口（dasbus，无子进程调用）创建并激活 WiFi 连接，
+# 结果（CONNECTED / FAILED <code>）通过特征值 Notify 异步上报。
+# 连接配置以固定连接名 xiaozhi-ble 持久化（重复配网会覆盖旧配置），
+# 需要系统运行 NetworkManager 且存在无线网卡，否则写入会收到 ERR unavailable。
+wifi:
+  connect_timeout_secs: 30.0    # 单次配网最长等待时间（秒），超时按 FAILED timeout 上报
+
 # 日志级别：trace/debug/info/warn/error
 log_level: info

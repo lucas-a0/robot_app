@@ -17,7 +17,8 @@
 
 1. **内核接口直接读**：`/proc/stat`（CPU）、`/proc/net/wireless`（信号强度）、
    ioctl（如 `SIOCGIWESSID` 取 SSID）。
-2. **成熟库**：netifaces（IP 地址）、dasbus（BlueZ D-Bus）。
+2. **成熟库**：netifaces（IP 地址）、dasbus（BlueZ 与 NetworkManager 的
+   D-Bus 接口）。
 3. **订阅/调用而非轮询**：ROS2 数据用内置 rclpy 节点订阅话题或调用服务
    （见 `battery.py` / `robot_control.py`），不要 shell 出 `ros2` CLI。
    rclpy 的 init/shutdown 是进程级全局的，上下文、节点和 spin 线程统一由
