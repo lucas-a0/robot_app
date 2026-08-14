@@ -27,10 +27,12 @@ from .control_client import ControlClient, ControlRequestError, ControlUnavailab
 from .cpu import CpuProvider
 from .gatt_server import BleControlServer, BridgeError
 from .latency import LatencyProvider
+from .nav_tasks import NavTaskManager
 from .network import NetworkProvider
 from .robot_control import RobotControl
 from .ros_runtime import RosRuntime
 from .wifi_config import WifiConfigurator
+from .zone_nav import ZoneNavigator
 
 
 class _Bridge:
@@ -38,6 +40,14 @@ class _Bridge:
 
     def __init__(self, config: BridgeConfig) -> None:
         self._client: ControlClient | None = None
+        # Navigation launch tasks: two fixed ros2 launch commands run as
+        # managed child processes (see nav_tasks.py); task templates are
+        # hardcoded, asynchronous events come back through notify_nav_task.
+        self._nav_tasks = NavTaskManager(on_notify=self._forward_nav_task_event)
+        # Zone navigation: BLE zone names are published as std_msgs/String
+        # messages on the configured topic from the shared ROS runtime node;
+        # publishing is fire-and-forget, so execute() returns the final reply.
+        self._zone_nav = ZoneNavigator(topic=config.zone_nav_topic)
         self._server = BleControlServer(
             callback=self._handle_command,
             url_callback=self._handle_url_update,
@@ -49,15 +59,17 @@ class _Bridge:
             initial_battery_status=(None, None),
             robot_control_callback=self._handle_robot_command,
             wifi_config_callback=self._handle_wifi_config,
+            nav_task_callback=self._nav_tasks.execute,
+            zone_nav_callback=self._zone_nav.execute,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
             on_notification=self._handle_notification,
             on_connection_change=self._handle_connection_change,
         )
-        # Battery and robot control share one rclpy node owned by the ROS
-        # runtime (rclpy init/shutdown are process-global); both attach to
-        # its node instead of creating their own contexts.
+        # Battery, robot control and zone navigation share one rclpy node
+        # owned by the ROS runtime (rclpy init/shutdown are process-global);
+        # they attach to its node instead of creating their own contexts.
         self._ros_runtime = RosRuntime()
         self._battery_provider = BatteryProvider(
             topic=config.battery_topic,
@@ -112,12 +124,17 @@ class _Bridge:
         assert self._client is not None
         self._client.start()
         # The shared rclpy node only comes up when a ROS-backed feature is
-        # configured; without a ROS2 environment both stay disabled.
-        if self._battery_provider.enabled or self._robot_control.enabled:
+        # configured; without a ROS2 environment they all stay disabled.
+        if (
+            self._battery_provider.enabled
+            or self._robot_control.enabled
+            or self._zone_nav.enabled
+        ):
             if self._ros_runtime.start():
                 node = self._ros_runtime.node
                 self._battery_provider.start(node)
                 self._robot_control.start(node)
+                self._zone_nav.start(node)
         self._network_provider.start()
         self._cpu_provider.start()
         self._bandwidth_provider.start()
@@ -135,6 +152,7 @@ class _Bridge:
         self._bandwidth_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
+        self._zone_nav.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
@@ -146,12 +164,16 @@ class _Bridge:
         # Stop the GATT server first: its shutdown releases an outstanding
         # push-to-talk press, which needs the client to still be up.
         self._server.stop()
+        # Then stop any running navigation launch tasks (SIGINT the process
+        # groups, SIGKILL whatever ignores it).
+        self._nav_tasks.stop_all()
         self._latency_provider.stop()
         self._bandwidth_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
         # Detach the ROS-backed features before shutting down the shared
         # rclpy context they run on.
+        self._zone_nav.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
@@ -165,6 +187,10 @@ class _Bridge:
         """Dispatch a WiFi provisioning request; an error text is relayed to the App."""
         error = self._wifi_configurator.connect(ssid, password)
         return f"ERR {error}" if error is not None else None
+
+    def _forward_nav_task_event(self, text: str) -> None:
+        """Relay an asynchronous nav-task event (STOPPED/EXITED) to the App."""
+        self._server.notify_nav_task(text)
 
     def _publish_wifi_result(self, code: str, ssid: str) -> None:
         """Relay the asynchronous provisioning outcome to the App."""

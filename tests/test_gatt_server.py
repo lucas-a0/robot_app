@@ -35,6 +35,9 @@ from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHAR_UUID
 from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import RobotControlCharacteristic
 from xiaozhi_ble.gatt_server import WebsocketUrlCharacteristic
+from xiaozhi_ble.gatt_server import ZONE_NAV_CHAR_UUID
+from xiaozhi_ble.gatt_server import ZONE_NAV_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import ZoneNavCharacteristic
 
 
 def _value(characteristic: CommandCharacteristic) -> str:
@@ -316,6 +319,42 @@ def test_robot_control_characteristic_relays_immediate_errors():
     assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
 
 
+def test_zone_nav_characteristic_dispatches_zones():
+    calls = []
+
+    def callback(zone: str) -> str:
+        calls.append(zone)
+        if zone == "garage_zone":
+            return "ERR command"
+        return f"OK {zone}"
+
+    characteristic = ZoneNavCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [ZONE_NAV_CHARACTERISTIC_CCCD_PATH]
+
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"  Charging_Zone \n"), {})
+    assert calls == ["charging_zone"]
+    assert bytes(characteristic.Value).decode("utf-8") == "OK charging_zone"
+
+    characteristic.WriteValue(list(b"garage_zone"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    characteristic.WriteValue([0xff], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    characteristic.WriteValue(list(b"  "), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    def broken(zone: str) -> str:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = ZoneNavCharacteristic(broken)
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"mowing_zone"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_wifi_config_characteristic_dispatches_requests():
     calls = []
 
@@ -397,6 +436,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert LATENCY_CHAR_UUID in str(managed_objects)
     assert ROBOT_CONTROL_CHAR_UUID in str(managed_objects)
     assert WIFI_CONFIG_CHAR_UUID in str(managed_objects)
+    assert ZONE_NAV_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )
@@ -414,6 +454,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert LATENCY_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert ZONE_NAV_CHARACTERISTIC_CCCD_PATH in managed_objects
     command_char = _unpack_properties(
         managed_objects["/org/xiaozhi/ble_app/service0/char0"][
             "org.bluez.GattCharacteristic1"

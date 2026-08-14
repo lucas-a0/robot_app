@@ -67,5 +67,13 @@ robot_control:
 wifi:
   connect_timeout_secs: 30.0    # 单次配网最长等待时间（秒），超时按 FAILED timeout 上报
 
+# 区域导航：App 向 Zone Nav 特征值写入四个固定区域名之一（charging_zone /
+# mowing_zone / pool_zone / equipment_zone），本模块通过共享的 rclpy 节点
+# （与 battery 同一个）向该话题发布 std_msgs/String 消息（data 为区域名）。
+# 需要 ROS2 环境（同 battery）；不可用时写入会收到 ERR unavailable。
+# topic 留空则禁用该功能。
+zone_nav:
+  topic: /xiaozhi_topic       # 区域导航目标话题（std_msgs/String）
+
 # 日志级别：trace/debug/info/warn/error
 log_level: info

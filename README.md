@@ -5,7 +5,9 @@
 手机 App 通过 BLE GATT 实现"按住说话"（协议见 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)），
 本模块把 BLE 控制指令转发给对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket，
 把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态回传给 App，
-并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下）。
+并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下），
+以及启停两个固定的导航 launch 任务（定位 bringup 与 Nav2 导航）、
+向 `/xiaozhi_topic` 发布四个固定区域的导航目标。
 
 ```text
 手机 App  <-- BLE GATT -->  xiaozhi-ble（本模块）  <-- Unix socket -->  xiaozhi 对话模块
@@ -21,8 +23,8 @@
   `sensor_msgs/BatteryState` 话题（默认 `/battery_state`），上报电量百分比和
   充电状态；ROS2 环境不可用时自动禁用，不影响其余功能。
 - `ros_runtime.py`：共享 rclpy 运行时，持有进程级唯一的 rclpy 上下文、
-  节点（`xiaozhi_ble`）和 spin 线程；battery 和 robot_control 都挂载在这个
-  节点上，不各自创建上下文。
+  节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control 和 zone_nav
+  都挂载在这个节点上，不各自创建上下文。
 - `robot_control.py`：机器人行为控制，把 App 写入的命令名按配置映射为
   `std_srvs/Trigger` 服务并异步调用；成功静默，失败通过特征值 Notify 上报。
 - `network.py`：网络状态获取，直接从内核读取 WiFi 状态（SSID 用 wireless
@@ -39,6 +41,13 @@
 - `wifi_config.py`：WiFi 配网，把 App 写入的 SSID/密码通过 NetworkManager
   D-Bus 接口创建并激活连接（固定连接名 `xiaozhi-ble`），结果异步回调上报；
   NetworkManager 或无线网卡不可用时自动降级。
+- `nav_tasks.py`：导航任务控制，把 App 写入的 START/STOP/STATUS 命令映射为
+  两个固定的 `ros2 launch` 任务（`localization` 定位 bringup、`navigation`
+  Nav2 导航），以独立进程组运行受管子进程，输出落日志文件，停止走进程组
+  SIGINT（超时 SIGKILL），崩溃异步上报。
+- `zone_nav.py`：区域导航，把 App 写入的四个固定区域名（`charging_zone`、
+  `mowing_zone`、`pool_zone`、`equipment_zone`）作为 `std_msgs/String` 发布到
+  `/xiaozhi_topic`（共享 rclpy 节点），发布即发即弃，即时应答 `OK <zone>`。
 - `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
 - `config.py`：YAML 配置加载。
 
@@ -182,6 +191,40 @@ robot_control:
   commands:
     stand_up: /base_bridge/stand_up
     lie_down: /base_bridge/lie_down
+```
+
+### 导航任务控制
+
+导航任务控制同样是本模块自己的功能。App 向 Nav Task 特征值写入
+`START <task> [key=value ...]` / `STOP <task>` / `STATUS`，模块把两个固定任务
+（`localization` 定位 bringup、`navigation` Nav2 导航）作为受管子进程启停：
+bash 包装脚本 source ROS2 与工作区环境后 `exec ros2 launch`（launch 参数走
+`"$@"` argv，不进命令字符串），进程独立进程组，停止时先发进程组 SIGINT、
+超时（10 秒）后 SIGKILL。任务参数白名单与默认值硬编码在 `nav_tasks.py`
+（本功能不走 config.yaml）；`START navigation` 要求 `localization` 已在运行。
+进程输出合并写入 `~/.cache/xiaozhi-ble/logs/<task>.log`（每次启动截断重写），
+不通过 BLE 转发；进程自行退出（崩溃）时通过 Notify 上报
+`EXITED <task> <code>` 并附最后一行输出摘要。
+
+注意：桥接正常退出会停止仍在运行的任务；桥接崩溃可能留下孤儿的 launch
+进程，需要人工上机清理后再 START 同名任务。导航工作区目录
+（`~/mid360_nav_project/ros2_ws`）不存在时 START 返回 `ERR unavailable`。
+
+### 区域导航
+
+区域导航同样是本模块自己的功能。App 向 Zone Nav 特征值写入四个固定区域名
+之一（`charging_zone`、`mowing_zone`、`pool_zone`、`equipment_zone`），模块在
+共享 rclpy 节点上向 `zone_nav.topic` 配置的话题（默认 `/xiaozhi_topic`）
+发布一条 `std_msgs/String` 消息（`data` 为小写区域名），后续导航行为由订阅
+该话题的模块完成。发布即发即弃，写入的即时应答即最终结果：成功 `OK <zone>`，
+区域名非法 `ERR command`，ROS 环境不可用时 `ERR unavailable`。`zone_nav.topic`
+留空则禁用该功能。
+
+配置示例：
+
+```yaml
+zone_nav:
+  topic: /xiaozhi_topic     # 区域导航目标话题（std_msgs/String）
 ```
 
 ## 依赖安装

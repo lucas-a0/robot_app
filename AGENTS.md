@@ -26,7 +26,11 @@
    不得各自 `rclpy.init()` 或 `rclpy.shutdown()`。
 
 新增数据源前，先确认有没有上面三类途径；实在没有（确需外部命令）时，先在
-讨论中说明理由再实现。
+讨论中说明理由再实现。目前已批准的例外：`nav_tasks.py`（App 触发启停两个
+固定的 `ros2 launch` 导航任务——Nav2 bringup 本质上就是拉起一堆节点进程，
+无法以库的方式进程内运行）。该模块对子进程做完整管理：独立进程组、
+SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查、**不解析输出
+采集数据**。
 
 ## 2. Provider 模式（数据采集模块）
 
@@ -34,8 +38,9 @@
 数据源时请照抄：
 
 - 独立线程 + `threading.Event` 停止信号；`start()` 幂等、`stop(timeout)` 可join。
-  例外：ROS 相关模块（`battery.py` 订阅、`robot_control.py` 服务调用）不自带
-  线程，`start(node)` 挂载到共享 runtime 节点上，由 runtime 的 spin 线程驱动。
+  例外：ROS 相关模块（`battery.py` 订阅、`robot_control.py` 服务调用、
+  `zone_nav.py` 发布）不自带线程，`start(node)` 挂载到共享 runtime 节点上，
+  由 runtime 的 spin 线程驱动。
 - **优雅降级**：依赖缺失时（rclpy 不可导入、没有无线网卡、`/proc` 文件不存在）
   `enabled` 为 False，`start()` 打日志后直接返回，不影响桥接其余功能；
   对应 GATT 特征值保持 `UNKNOWN`。

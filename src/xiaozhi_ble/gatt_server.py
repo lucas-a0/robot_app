@@ -31,6 +31,8 @@ BANDWIDTH_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef7"
 LATENCY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef8"
 ROBOT_CONTROL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef9"
 WIFI_CONFIG_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefa"
+NAV_TASK_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefb"
+ZONE_NAV_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefc"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
@@ -46,6 +48,8 @@ BANDWIDTH_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char6"
 LATENCY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char7"
 ROBOT_CONTROL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char8"
 WIFI_CONFIG_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char9"
+NAV_TASK_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char10"
+ZONE_NAV_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char11"
 CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
 URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
 ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
@@ -58,6 +62,8 @@ BANDWIDTH_CHARACTERISTIC_CCCD_PATH = f"{BANDWIDTH_CHARACTERISTIC_PATH}/desc0"
 LATENCY_CHARACTERISTIC_CCCD_PATH = f"{LATENCY_CHARACTERISTIC_PATH}/desc0"
 ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH = f"{ROBOT_CONTROL_CHARACTERISTIC_PATH}/desc0"
 WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH = f"{WIFI_CONFIG_CHARACTERISTIC_PATH}/desc0"
+NAV_TASK_CHARACTERISTIC_CCCD_PATH = f"{NAV_TASK_CHARACTERISTIC_PATH}/desc0"
+ZONE_NAV_CHARACTERISTIC_CCCD_PATH = f"{ZONE_NAV_CHARACTERISTIC_PATH}/desc0"
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
 # Receives (command, reason), returns the response text relayed to the App,
@@ -73,6 +79,13 @@ RobotControlCallback = Callable[[str], str | None]
 # App (e.g. "ERR busy"), or None when the request was accepted and its result
 # is reported asynchronously ("CONNECTED ..." / "FAILED ...").
 WifiConfigCallback = Callable[[str, str], str | None]
+# Receives the raw Nav Task write text, returns the immediate reply relayed
+# to the App (e.g. "STARTED navigation", "ERR task foo" or the STATUS text).
+NavTaskCallback = Callable[[str], str]
+# Receives the zone name, returns the immediate reply relayed to the App
+# (e.g. "OK charging_zone" or "ERR command"); publishing is fire-and-forget,
+# so the immediate reply is the final result.
+ZoneNavCallback = Callable[[str], str]
 
 
 class BridgeError(Exception):
@@ -900,6 +913,172 @@ class WifiConfigCharacteristic(InterfaceTemplate):
         logger.debug(f"Sent BLE WiFi config notification: {text!r}")
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class NavTaskCharacteristic(InterfaceTemplate):
+    """Receive nav-task commands and notify replies and task events."""
+
+    def __init__(self, callback: NavTaskCallback) -> None:
+        super().__init__(self)
+        self._callback = callback
+        self._flags = ["read", "write", "notify"]
+        self._notifying = False
+        try:
+            initial = callback("status")
+        except Exception:
+            logger.exception("Failed to query initial nav-task status")
+            initial = ""
+        self._value: List[Byte] = list(initial.encode("utf-8"))
+
+    @property
+    def UUID(self) -> Str:
+        return NAV_TASK_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [NAV_TASK_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        """Return the most recently published reply or task event."""
+        return _read_bytes(self._value, options)
+
+    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
+        """Handle a UTF-8 START/STOP/STATUS nav-task command."""
+        try:
+            text = bytes(value).decode("utf-8").strip()
+        except UnicodeDecodeError:
+            self._notify("ERR encoding")
+            return
+
+        logger.info(f"Received BLE nav-task command: {text!r}")
+        try:
+            reply = self._callback(text)
+        except Exception:
+            logger.exception("Failed to dispatch BLE nav-task command")
+            self._notify("ERR internal")
+            return
+        self._notify(reply)
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+        try:
+            self._notify(self._callback("status"))
+        except Exception:
+            logger.exception("Failed to query nav-task status for notification")
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def report(self, text: str) -> None:
+        """Publish an asynchronous task event (STOPPED/EXITED)."""
+        self._notify(text)
+
+    def _notify(self, text: str) -> None:
+        data = list(_bounded_text(text).encode("utf-8"))
+        self._value = data
+        if not self._notifying:
+            return
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", data)},
+                [],
+            )
+        except Exception:
+            logger.exception(f"Failed to emit BLE nav-task notification: {text!r}")
+            return
+        logger.debug(f"Sent BLE nav-task notification: {text!r}")
+
+
+@dbus_interface("org.bluez.GattCharacteristic1")
+class ZoneNavCharacteristic(InterfaceTemplate):
+    """Receive zone-navigation writes and notify the publish result."""
+
+    def __init__(self, callback: ZoneNavCallback) -> None:
+        super().__init__(self)
+        self._callback = callback
+        self._flags = ["read", "write", "notify"]
+        self._notifying = False
+        self._value: List[Byte] = []
+
+    @property
+    def UUID(self) -> Str:
+        return ZONE_NAV_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [ZONE_NAV_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        """Return the most recently published reply (empty when none)."""
+        return _read_bytes(self._value, options)
+
+    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
+        """Handle a UTF-8 zone name; the reply is the final result."""
+        try:
+            zone = bytes(value).decode("utf-8").strip().lower()
+        except UnicodeDecodeError:
+            self._notify("ERR encoding")
+            return
+
+        logger.info(f"Received BLE zone-nav command: {zone!r}")
+        if not zone:
+            self._notify("ERR command")
+            return
+        try:
+            reply = self._callback(zone)
+        except Exception:
+            logger.exception("Failed to dispatch BLE zone-nav command")
+            self._notify("ERR internal")
+            return
+        self._notify(reply)
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def _notify(self, text: str) -> None:
+        data = list(_bounded_text(text).encode("utf-8"))
+        self._value = data
+        if not self._notifying:
+            return
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", data)},
+                [],
+            )
+        except Exception:
+            logger.exception(f"Failed to emit BLE zone-nav notification: {text!r}")
+            return
+        logger.debug(f"Sent BLE zone-nav notification: {text!r}")
+
+
 @dbus_interface("org.bluez.GattDescriptor1")
 class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
     """Expose the standard descriptor clients write to enable notifications."""
@@ -973,6 +1152,8 @@ class ControlService(InterfaceTemplate):
             LATENCY_CHARACTERISTIC_PATH,
             ROBOT_CONTROL_CHARACTERISTIC_PATH,
             WIFI_CONFIG_CHARACTERISTIC_PATH,
+            NAV_TASK_CHARACTERISTIC_PATH,
+            ZONE_NAV_CHARACTERISTIC_PATH,
         ]
 
 
@@ -1044,6 +1225,8 @@ class GattApplication(InterfaceTemplate):
                             LATENCY_CHARACTERISTIC_PATH,
                             ROBOT_CONTROL_CHARACTERISTIC_PATH,
                             WIFI_CONFIG_CHARACTERISTIC_PATH,
+                            NAV_TASK_CHARACTERISTIC_PATH,
+                            ZONE_NAV_CHARACTERISTIC_PATH,
                         ],
                     ),
                 }
@@ -1141,6 +1324,26 @@ class GattApplication(InterfaceTemplate):
                     ),
                 }
             },
+            NAV_TASK_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", NAV_TASK_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "write", "notify"]),
+                    "Descriptors": Variant(
+                        "ao", [NAV_TASK_CHARACTERISTIC_CCCD_PATH]
+                    ),
+                }
+            },
+            ZONE_NAV_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", ZONE_NAV_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "write", "notify"]),
+                    "Descriptors": Variant(
+                        "ao", [ZONE_NAV_CHARACTERISTIC_CCCD_PATH]
+                    ),
+                }
+            },
             CHARACTERISTIC_CCCD_PATH: {
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
@@ -1211,6 +1414,20 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
+            NAV_TASK_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", NAV_TASK_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
+            ZONE_NAV_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", ZONE_NAV_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
         }
 
 
@@ -1229,6 +1446,8 @@ class BleControlServer:
         url_callback: UrlCallback | None = None,
         robot_control_callback: RobotControlCallback | None = None,
         wifi_config_callback: WifiConfigCallback | None = None,
+        nav_task_callback: NavTaskCallback | None = None,
+        zone_nav_callback: ZoneNavCallback | None = None,
     ) -> None:
         self._callback = callback
         self._url_callback = url_callback or (lambda _url: None)
@@ -1237,6 +1456,12 @@ class BleControlServer:
         )
         self._wifi_config_callback = wifi_config_callback or (
             lambda _ssid, _password: "ERR unavailable"
+        )
+        self._nav_task_callback = nav_task_callback or (
+            lambda _text: "ERR unavailable"
+        )
+        self._zone_nav_callback = zone_nav_callback or (
+            lambda _zone: "ERR unavailable"
         )
         self._adapter_path = adapter_path
         self._device_name = device_name
@@ -1267,6 +1492,8 @@ class BleControlServer:
         self._latency_characteristic: LatencyStatusCharacteristic | None = None
         self._robot_control_characteristic: RobotControlCharacteristic | None = None
         self._wifi_config_characteristic: WifiConfigCharacteristic | None = None
+        self._nav_task_characteristic: NavTaskCharacteristic | None = None
+        self._zone_nav_characteristic: ZoneNavCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1436,6 +1663,18 @@ class BleControlServer:
 
         GLib.idle_add(update)
 
+    def notify_nav_task(self, text: str) -> None:
+        """Publish an asynchronous nav-task event from any thread."""
+        if self._nav_task_characteristic is None:
+            return
+
+        def update() -> bool:
+            if self._nav_task_characteristic is not None:
+                self._nav_task_characteristic.report(text)
+            return False
+
+        GLib.idle_add(update)
+
     def _run(self) -> None:
         try:
             self._bus = SystemMessageBus()
@@ -1463,6 +1702,12 @@ class BleControlServer:
             )
             self._wifi_config_characteristic = WifiConfigCharacteristic(
                 self._wifi_config_callback
+            )
+            self._nav_task_characteristic = NavTaskCharacteristic(
+                self._nav_task_callback
+            )
+            self._zone_nav_characteristic = ZoneNavCharacteristic(
+                self._zone_nav_callback
             )
             command_cccd = ClientCharacteristicConfigurationDescriptor(
                 CHARACTERISTIC_PATH,
@@ -1513,6 +1758,16 @@ class BleControlServer:
                 WIFI_CONFIG_CHARACTERISTIC_PATH,
                 self._wifi_config_characteristic.StartNotify,
                 self._wifi_config_characteristic.StopNotify,
+            )
+            nav_task_cccd = ClientCharacteristicConfigurationDescriptor(
+                NAV_TASK_CHARACTERISTIC_PATH,
+                self._nav_task_characteristic.StartNotify,
+                self._nav_task_characteristic.StopNotify,
+            )
+            zone_nav_cccd = ClientCharacteristicConfigurationDescriptor(
+                ZONE_NAV_CHARACTERISTIC_PATH,
+                self._zone_nav_characteristic.StartNotify,
+                self._zone_nav_characteristic.StopNotify,
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -1572,6 +1827,20 @@ class BleControlServer:
             )
             self._bus.publish_object(
                 WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH, wifi_config_cccd
+            )
+            self._bus.publish_object(
+                NAV_TASK_CHARACTERISTIC_PATH,
+                self._nav_task_characteristic,
+            )
+            self._bus.publish_object(
+                NAV_TASK_CHARACTERISTIC_CCCD_PATH, nav_task_cccd
+            )
+            self._bus.publish_object(
+                ZONE_NAV_CHARACTERISTIC_PATH,
+                self._zone_nav_characteristic,
+            )
+            self._bus.publish_object(
+                ZONE_NAV_CHARACTERISTIC_CCCD_PATH, zone_nav_cccd
             )
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)

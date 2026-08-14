@@ -3,7 +3,7 @@
 本文档定义手机 App 与小智机器人之间的 BLE（Bluetooth Low Energy）控制协议。
 协议用于实现与 Web 页面相同的“按住说话”行为：按钮按下开始收音，按钮松开结束收音。
 
-协议版本：`1.6`
+协议版本：`1.8`
 
 ## 1. 适用范围
 
@@ -18,7 +18,7 @@
 | 广播名称默认值 | `Xiaozhi` |
 | Service UUID | `12345678-1234-5678-1234-56789abcdef0` |
 
-Service 内的特征值按功能分为四类，UUID 均为 `12345678-1234-5678-1234-56789abcdefN`：
+Service 内的特征值按功能分为五类，UUID 均为 `12345678-1234-5678-1234-56789abcdefN`：
 
 | 类别 | 特征值 | UUID 尾号 | 属性 |
 |---|---|---|---|
@@ -32,6 +32,8 @@ Service 内的特征值按功能分为四类，UUID 均为 `12345678-1234-5678-1
 | 状态监测 | Latency Status Characteristic | `abcdef8` | Read、Notify |
 | 行为控制 | Robot Control Characteristic | `abcdef9` | Read、Write、Notify |
 | 连接配置 | WiFi Config Characteristic | `abcdefa` | Read、Write、Notify |
+| 任务控制 | Nav Task Characteristic | `abcdefb` | Read、Write、Notify |
+| 任务控制 | Zone Nav Characteristic | `abcdefc` | Read、Write、Notify |
 
 广播名称可在机器人侧配置修改。App 应以 Service UUID 识别设备，不应只依赖广播名称。
 
@@ -46,7 +48,7 @@ Service 内的特征值按功能分为四类，UUID 均为 `12345678-1234-5678-1
 - 状态监测类特征值在数据尚未获取到时统一报 `UNKNOWN`；字段级缺失用占位符（如 `-`）。
 - 各特征值的具体文本格式见对应章节：Command 见第 4 节，WebSocket URL 见第 5 节，
   Error 见第 6 节，状态监测各特征值见第 7 节，Robot Control 见第 8 节，
-  WiFi Config 见第 9 节。
+  WiFi Config 见第 9 节，Nav Task 见第 10 节，Zone Nav 见第 11 节。
 
 ## 4. 语音控制（按住说话）
 
@@ -370,7 +372,150 @@ App                                      Robot
  |<--- Network Status: WIFI -42 ... MyHome|  由状态监测特征值另行上报
 ```
 
-## 10. 连接约束
+## 10. 导航任务控制（Nav Task）
+
+App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两个固定的 ROS2 导航
+任务（`ros2 launch` 进程）：`localization`（定位 bringup）和 `navigation`
+（Nav2 导航）。两个任务的启动命令与默认参数由机器人侧固定（见 10.2），App 只能
+在白名单内覆盖参数。
+
+- 任务进程由机器人侧以独立进程组运行；桥接进程正常退出（含服务重启）时会先停止
+  仍在运行的任务。桥接异常崩溃可能留下孤儿的 launch 进程，需要人工上机清理
+  （见 10.5）。
+- 任务的 stdout/stderr 不通过 BLE 转发；机器人侧写入日志文件
+  `~/.cache/xiaozhi-ble/logs/<task>.log`（每次启动截断重写），供上机排查。
+- 写入/通知均为 UTF-8 文本，通知不超过 180 字节；带参数覆盖的写入可能较长，写入前
+  建议协商至少 183 字节的 ATT MTU（同 URL 特征值）。机器人解析时去除首尾空白，
+  命令动词与任务名忽略大小写；参数 key 小写规范化，value 原样保留。
+
+### 10.1 写入命令（App → 机器人）
+
+| 写入内容 | 含义 |
+|---|---|
+| `START <task>` | 以默认参数启动任务 |
+| `START <task> key=value ...` | 覆盖部分参数后启动任务（未覆盖的 key 用默认值） |
+| `STOP <task>` | 优雅停止任务（进程组 SIGINT，超时未退出则 SIGKILL） |
+| `STATUS` | 查询两个任务的当前状态 |
+
+- `<task>` 为 `localization` 或 `navigation`。
+- `key=value` 之间以空白分隔；key 必须在 10.2 的白名单内；value 不能为空、不能含
+  空白字符。
+- `START navigation` 要求 `localization` 处于 `RUNNING`，否则拒绝（见
+  `ERR state localization not_running`）；机器人不会自动代起 localization，
+  启动顺序由 App 控制。
+
+### 10.2 可覆盖参数与默认值
+
+`localization`（对应 `courtyard_localization_bringup.launch.py`）：
+
+| key | 默认值 |
+|---|---|
+| `map` | `/home/sunrise/mid360_nav_project/ros2_ws/src/robot_nav617/navigation/maps/fastlio_map_nav2_v1/map.yaml` |
+| `params_file` | `/home/sunrise/mid360_nav_project/ros2_ws/src/robot_nav617/navigation/config/nav2_mid360_params_exhibition.yaml` |
+| `scan_topic` | `/scan` |
+| `start_lidar` | `true` |
+| `start_lio` | `true` |
+| `start_scan` | `true` |
+| `start_localization` | `true` |
+
+`navigation`（对应 `courtyard_navigation.launch.py`）：
+
+| key | 默认值 |
+|---|---|
+| `params_file` | `/home/sunrise/mid360_nav_project/ros2_ws/src/robot_nav617/navigation/config/nav2_mid360_params_exhibition.yaml` |
+| `start_lio_odom_twist` | `true` |
+| `start_xiaozhi_bridge` | `false` |
+| `use_sim_time` | `false` |
+| `autostart` | `true` |
+
+默认值可能随机器人部署调整，App 不应把默认值写死在本地；需要默认值时省略该 key
+即可。
+
+### 10.3 应答与状态通知（机器人 → App）
+
+App 必须先订阅 Nav Task 特征值的 Notify 再写入；订阅成功后机器人立即推送当前
+`STATE ...`。`STARTED`/`STOPPING`/`ERR` 为写入的即时应答，`STOPPED`/`EXITED`
+为异步通知：
+
+| 通知内容 | 含义 |
+|---|---|
+| `STARTED <task>` | 即时应答：launch 进程已拉起（**不代表**内部节点已就绪） |
+| `STOPPING <task>` | 即时应答：停止请求已接受，正在优雅关停 |
+| `STOPPED <task>` | 异步：任务进程已退出（由 `STOP` 触发） |
+| `EXITED <task> <code> [detail]` | 异步：任务进程自行退出（崩溃或被外部杀死）；`code` 为退出码；`detail` 为最后一行非空输出摘要，可能缺省或被截断 |
+| `STATE localization <s1> navigation <s2>` | `STATUS` 的应答及订阅后的初始推送；`<sN>` 为 `RUNNING`/`STOPPING`/`STOPPED` |
+
+错误应答（写入的即时回复，无后续通知）：
+
+| 通知内容 | 含义 |
+|---|---|
+| `ERR encoding` | 写入内容不是合法 UTF-8 |
+| `ERR command` | 无法识别的命令（动词不是 START/STOP/STATUS，或格式不符） |
+| `ERR task <task>` | 任务名不存在 |
+| `ERR param <task> <key>` | 参数 key 不在白名单，或 value 为空/含空白字符 |
+| `ERR state <task> already_running` | 任务已在运行，重复 START |
+| `ERR state <task> stopping` | 任务正在停止中，稍后再试 |
+| `ERR state <task> not_running` | 任务未在运行，无法 STOP |
+| `ERR state localization not_running` | START navigation 时 localization 未在运行 |
+| `ERR unavailable` | 导航工作区不存在，功能不可用 |
+| `ERR spawn <task> <message>` | 进程拉起失败 |
+| `ERR internal` | 机器人内部未能调度命令 |
+
+读取该特征值返回最近一次通知文本（尚无通知时为当前 `STATE ...`）。
+
+### 10.4 标准交互时序
+
+```text
+App                                      Robot
+ |---- Subscribe Nav Task Notify ------->|
+ |<- STATE localization STOPPED navigation STOPPED
+ |---- Write "START localization" ------>|
+ |<---------------- STARTED localization -|
+ |             （launch 进程运行中）       |
+ |---- Write "START navigation" -------->|
+ |<----------------- STARTED navigation --|
+ |                                         |
+ |---- Write "STOP navigation" --------->|
+ |<----------------- STOPPING navigation -|
+ |<------------------ STOPPED navigation -|
+```
+
+异常示例：任务进程崩溃时机器人主动推送，如
+`EXITED navigation 1 [amcl]: map could not be loaded`。
+
+### 10.5 实现注意
+
+- `STARTED` 只表示进程拉起成功；Nav2 内部节点就绪需要数秒到数十秒，App 不应依据
+  `STARTED` 立即假定可以下发导航目标。
+- 桥接进程正常退出（含服务重启）时会先停止仍在运行的任务；桥接崩溃则可能留下孤儿
+  launch 进程。此时再次 `START` 同名任务可能因资源冲突失败，需要人工上机清理残留
+  进程（如结束对应的 `ros2 launch` 进程组）。
+
+## 11. 区域导航（Zone Nav）
+
+App 可以向 Zone Nav 特征值写入区域名，让机器人导航到四个固定区域之一：
+`charging_zone`（充电区）、`mowing_zone`（割草区）、`pool_zone`（泳池区）、
+`equipment_zone`（设备区）。机器人侧通过共享 rclpy 节点向 ROS2 话题
+`/xiaozhi_topic` 发布一条 `std_msgs/String` 消息（`data` 为区域名），后续的
+导航行为由订阅该话题的模块完成。
+
+- 写入内容为区域名（UTF-8 文本），只有上述四个合法值；机器人解析时去除首尾
+  空白并忽略大小写，发布到话题的 `data` 一律为小写区域名。
+- 发布是即发即弃（fire-and-forget），写入的即时应答即最终结果：
+
+| 通知内容 | 含义 |
+|---|---|
+| `OK <zone>` | 消息已发布到 `/xiaozhi_topic`（`<zone>` 为小写区域名） |
+| `ERR encoding` | 写入内容不是合法 UTF-8 |
+| `ERR command` | 区域名不是四个合法值之一（含空写入） |
+| `ERR unavailable` | 区域导航功能不可用（ROS 环境缺失或功能被禁用） |
+| `ERR internal` | 机器人内部未能调度命令 |
+
+读取该特征值返回最近一次应答文本（尚无应答时为空）。`OK` 只表示消息已交给
+ROS2 发布者，不表示机器人已开始移动或已到达目标区域；导航进度与到达情况
+不通过 BLE 上报。
+
+## 12. 连接约束
 
 - 当前版本按单个控制 App 设计，不支持多个 App 同时争用按住说话控制权。
 - 当前版本不定义应用层鉴权、加密载荷或强制 BLE 配对；连接安全由内部测试环境负责。
@@ -378,7 +523,7 @@ App                                      Robot
 - App 应设置合理的连接和写入超时。一次写入失败时，应将按钮恢复为未按下状态；若连接仍然
   有效，可以补发一次 `stop`，但不应自动重试 `start`。
 
-## 11. App 实现检查表
+## 13. App 实现检查表
 
 语音控制：
 
@@ -417,3 +562,16 @@ WiFi 配网：
 17. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
     以 `CONNECTED`/`FAILED` 为准更新界面，不要依据 `CONNECTING` 假定连接成功。
 18. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。
+
+导航任务：
+
+19. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
+    更新界面；`START navigation` 前先确认 localization 为 `RUNNING`。
+20. `STARTED` 不代表导航就绪；任务崩溃以 `EXITED` 通知为准提示用户，详情上机查看
+    `~/.cache/xiaozhi-ble/logs/<task>.log`。
+
+区域导航：
+
+21. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
+    `pool_zone`、`equipment_zone`）；以 `OK <zone>` 确认消息已发布，
+    收到 `ERR ...` 时按错误码提示用户。
