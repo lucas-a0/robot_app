@@ -7,6 +7,9 @@ from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHAR_UUID
 from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CCCD_UUID
 from xiaozhi_ble.gatt_server import CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import CMD_VEL_CHAR_UUID
+from xiaozhi_ble.gatt_server import CMD_VEL_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import CmdVelCharacteristic
 from xiaozhi_ble.gatt_server import CPU_CHAR_UUID
 from xiaozhi_ble.gatt_server import CPU_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import NETWORK_CHAR_UUID
@@ -355,6 +358,46 @@ def test_zone_nav_characteristic_dispatches_zones():
     assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
 
 
+def test_cmd_vel_characteristic_dispatches_velocities():
+    calls = []
+
+    def callback(text: str) -> str:
+        calls.append(text)
+        if text == "fast 0.0":
+            return "ERR command"
+        return f"OK {text}"
+
+    characteristic = CmdVelCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [CMD_VEL_CHARACTERISTIC_CCCD_PATH]
+
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"  -0.30 0.0 \n"), {})
+    assert calls == ["-0.30 0.0"]
+    assert bytes(characteristic.Value).decode("utf-8") == "OK -0.30 0.0"
+
+    # Identical repeated writes are dispatched again (no dedup).
+    characteristic.WriteValue(list(b"-0.30 0.0"), {})
+    assert calls == ["-0.30 0.0", "-0.30 0.0"]
+
+    characteristic.WriteValue(list(b"fast 0.0"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    characteristic.WriteValue([0xff], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    characteristic.WriteValue(list(b"  "), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    def broken(text: str) -> str:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = CmdVelCharacteristic(broken)
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"0.1 0.0"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_wifi_config_characteristic_dispatches_requests():
     calls = []
 
@@ -437,6 +480,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert ROBOT_CONTROL_CHAR_UUID in str(managed_objects)
     assert WIFI_CONFIG_CHAR_UUID in str(managed_objects)
     assert ZONE_NAV_CHAR_UUID in str(managed_objects)
+    assert CMD_VEL_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )

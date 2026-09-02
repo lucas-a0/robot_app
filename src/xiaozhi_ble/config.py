@@ -69,6 +69,10 @@ class BridgeConfig:
         return self._str("zone_nav.topic", "/xiaozhi_topic")
 
     @property
+    def cmd_vel_topic(self) -> str:
+        return self._str("cmd_vel.topic", "/cmd_vel")
+
+    @property
     def network_interface(self) -> str:
         """WiFi interface name; empty means auto-detect the first wlan*."""
         return self._str("network.interface", "")

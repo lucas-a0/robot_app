@@ -22,6 +22,7 @@ from loguru import logger
 
 from .battery import BatteryProvider
 from .bandwidth import BandwidthProvider
+from .cmd_vel import CmdVelPublisher
 from .config import BridgeConfig
 from .control_client import ControlClient, ControlRequestError, ControlUnavailable
 from .cpu import CpuProvider
@@ -48,6 +49,10 @@ class _Bridge:
         # messages on the configured topic from the shared ROS runtime node;
         # publishing is fire-and-forget, so execute() returns the final reply.
         self._zone_nav = ZoneNavigator(topic=config.zone_nav_topic)
+        # Velocity control: BLE "<linear_x> <angular_z>" writes are published
+        # as geometry_msgs/Twist on the configured topic from the shared ROS
+        # runtime node; every write publishes exactly one message (no dedup).
+        self._cmd_vel = CmdVelPublisher(topic=config.cmd_vel_topic)
         self._server = BleControlServer(
             callback=self._handle_command,
             url_callback=self._handle_url_update,
@@ -61,15 +66,17 @@ class _Bridge:
             wifi_config_callback=self._handle_wifi_config,
             nav_task_callback=self._nav_tasks.execute,
             zone_nav_callback=self._zone_nav.execute,
+            cmd_vel_callback=self._cmd_vel.execute,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
             on_notification=self._handle_notification,
             on_connection_change=self._handle_connection_change,
         )
-        # Battery, robot control and zone navigation share one rclpy node
-        # owned by the ROS runtime (rclpy init/shutdown are process-global);
-        # they attach to its node instead of creating their own contexts.
+        # Battery, robot control, zone navigation and velocity control share
+        # one rclpy node owned by the ROS runtime (rclpy init/shutdown are
+        # process-global); they attach to its node instead of creating their
+        # own contexts.
         self._ros_runtime = RosRuntime()
         self._battery_provider = BatteryProvider(
             topic=config.battery_topic,
@@ -129,12 +136,14 @@ class _Bridge:
             self._battery_provider.enabled
             or self._robot_control.enabled
             or self._zone_nav.enabled
+            or self._cmd_vel.enabled
         ):
             if self._ros_runtime.start():
                 node = self._ros_runtime.node
                 self._battery_provider.start(node)
                 self._robot_control.start(node)
                 self._zone_nav.start(node)
+                self._cmd_vel.start(node)
         self._network_provider.start()
         self._cpu_provider.start()
         self._bandwidth_provider.start()
@@ -153,6 +162,7 @@ class _Bridge:
         self._cpu_provider.stop()
         self._network_provider.stop()
         self._zone_nav.stop()
+        self._cmd_vel.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
@@ -174,6 +184,7 @@ class _Bridge:
         # Detach the ROS-backed features before shutting down the shared
         # rclpy context they run on.
         self._zone_nav.stop()
+        self._cmd_vel.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()

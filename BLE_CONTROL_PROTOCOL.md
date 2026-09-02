@@ -3,7 +3,7 @@
 本文档定义手机 App 与小智机器人之间的 BLE（Bluetooth Low Energy）控制协议。
 协议用于实现与 Web 页面相同的“按住说话”行为：按钮按下开始收音，按钮松开结束收音。
 
-协议版本：`1.8`
+协议版本：`1.9`
 
 ## 1. 适用范围
 
@@ -34,6 +34,7 @@ Service 内的特征值按功能分为五类，UUID 均为 `12345678-1234-5678-1
 | 连接配置 | WiFi Config Characteristic | `abcdefa` | Read、Write、Notify |
 | 任务控制 | Nav Task Characteristic | `abcdefb` | Read、Write、Notify |
 | 任务控制 | Zone Nav Characteristic | `abcdefc` | Read、Write、Notify |
+| 运动控制 | Cmd Vel Characteristic | `abcdefd` | Read、Write、Notify |
 
 广播名称可在机器人侧配置修改。App 应以 Service UUID 识别设备，不应只依赖广播名称。
 
@@ -44,11 +45,13 @@ Service 内的特征值按功能分为五类，UUID 均为 `12345678-1234-5678-1
 - App 写入时可以带首尾空白；机器人解析时会去除首尾空白并忽略命令大小写。
 - Command 特征值中的命令、响应和状态均不超过默认 ATT MTU 下单包可承载的 20 字节；
   其余特征值按 180 字节上限处理，超长文本由机器人侧截断。
-- App 应优先使用 GATT Write With Response，确认写入已被 BLE 协议栈接收。
+- App 应优先使用 GATT Write With Response，确认写入已被 BLE 协议栈接收；
+  需要高频连续写入的 Cmd Vel 特征值除外（见第 12 节）。
 - 状态监测类特征值在数据尚未获取到时统一报 `UNKNOWN`；字段级缺失用占位符（如 `-`）。
 - 各特征值的具体文本格式见对应章节：Command 见第 4 节，WebSocket URL 见第 5 节，
   Error 见第 6 节，状态监测各特征值见第 7 节，Robot Control 见第 8 节，
-  WiFi Config 见第 9 节，Nav Task 见第 10 节，Zone Nav 见第 11 节。
+  WiFi Config 见第 9 节，Nav Task 见第 10 节，Zone Nav 见第 11 节，
+  Cmd Vel 见第 12 节。
 
 ## 4. 语音控制（按住说话）
 
@@ -286,9 +289,7 @@ App 可以读取或订阅 Latency Status 特征值来获取机器人到对话服
 ## 8. 机器人行为控制（Robot Control）
 
 App 可以向 Robot Control 特征值写入命令名，控制机器人执行预配置的行为（如站立、
-蹲下）。机器人侧维护一张“命令名 → ROS2 服务”的映射表（见
-`config.yaml.example` 的 `robot_control.commands`），写入的命令名查表后异步调用
-对应的 `std_srvs/Trigger` 服务。
+蹲下）。机器人侧维护一张“命令名 → 行为”的映射表，写入的命令名查表后异步执行。
 
 - App 写入内容为命令名（UTF-8 文本），例如 `stand_up`、`lie_down`；机器人解析时
   去除首尾空白并忽略大小写。
@@ -300,8 +301,8 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 |---|---|
 | `ERR encoding` | 写入内容不是合法 UTF-8 |
 | `ERR command` | 命令名未在机器人侧映射表中配置 |
-| `ERR unavailable` | 机器人控制功能不可用（ROS 环境缺失或功能被禁用） |
-| `ERR unavailable <command>` | 命令对应的 ROS 服务当前不在线 |
+| `ERR unavailable` | 机器人控制功能不可用 |
+| `ERR unavailable <command>` | 命令对应的行为当前不可用 |
 | `ERR failed <command> <message>` | 服务返回 `success=false`（`message` 为服务给出的原因）或调用发生异常 |
 | `ERR timeout <command>` | 服务调用超过机器人侧配置的超时时间（默认 10 秒） |
 | `ERR internal` | 机器人内部未能调度命令 |
@@ -312,9 +313,9 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 
 ## 9. WiFi 配网（WiFi Config）
 
-App 可以向 WiFi Config 特征值写入目标 WiFi 的 SSID 和密码，机器人通过本机网络管理器
-（NetworkManager）连接指定 WiFi，并把连接结果通过 Notify 异步上报。机器人侧保存该
-WiFi 配置（固定连接名 `xiaozhi-ble`），重启网络后按系统策略自动重连。
+App 可以向 WiFi Config 特征值写入目标 WiFi 的 SSID 和密码，机器人连接指定
+WiFi，并把连接结果通过 Notify 异步上报。机器人侧保存该 WiFi 配置，重启网络后
+自动重连。
 
 ### 9.1 写入格式（App → 机器人）
 
@@ -352,7 +353,7 @@ App 必须先订阅 WiFi Config 特征值的 Notify 再写入，否则可能收�
 | `ERR encoding` | 写入内容不是合法 UTF-8 |
 | `ERR invalid` | 格式不符（SSID 为空或超长、密码长度非法） |
 | `ERR busy` | 上一次配网仍在进行中；机器人同时只处理一次配网 |
-| `ERR unavailable` | 配网功能不可用（无 NetworkManager 或没有无线网卡） |
+| `ERR unavailable` | 配网功能不可用 |
 
 `ssid` 一律为通知的最后一个字段，可能包含空格；App 解析时先取前面的固定字段，
 其余部分作为 SSID。读取该特征值返回最近一次通知文本（尚无通知时为空）。
@@ -374,16 +375,12 @@ App                                      Robot
 
 ## 10. 导航任务控制（Nav Task）
 
-App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两个固定的 ROS2 导航
-任务（`ros2 launch` 进程）：`localization`（定位 bringup）和 `navigation`
-（Nav2 导航）。两个任务的启动命令与默认参数由机器人侧固定（见 10.2），App 只能
-在白名单内覆盖参数。
+App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两个固定的导航
+任务：`localization`（定位）和 `navigation`（导航）。两个任务的默认参数
+由机器人侧固定（见 10.2），App 只能在白名单内覆盖参数。
 
-- 任务进程由机器人侧以独立进程组运行；桥接进程正常退出（含服务重启）时会先停止
-  仍在运行的任务。桥接异常崩溃可能留下孤儿的 launch 进程，需要人工上机清理
-  （见 10.5）。
-- 任务的 stdout/stderr 不通过 BLE 转发；机器人侧写入日志文件
-  `~/.cache/xiaozhi-ble/logs/<task>.log`（每次启动截断重写），供上机排查。
+- 机器人侧服务正常停止（含服务重启）时会先停止仍在运行的任务。
+- 任务输出不通过 BLE 转发。
 - 写入/通知均为 UTF-8 文本，通知不超过 180 字节；带参数覆盖的写入可能较长，写入前
   建议协商至少 183 字节的 ATT MTU（同 URL 特征值）。机器人解析时去除首尾空白，
   命令动词与任务名忽略大小写；参数 key 小写规范化，value 原样保留。
@@ -394,7 +391,7 @@ App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两
 |---|---|
 | `START <task>` | 以默认参数启动任务 |
 | `START <task> key=value ...` | 覆盖部分参数后启动任务（未覆盖的 key 用默认值） |
-| `STOP <task>` | 优雅停止任务（进程组 SIGINT，超时未退出则 SIGKILL） |
+| `STOP <task>` | 停止任务 |
 | `STATUS` | 查询两个任务的当前状态 |
 
 - `<task>` 为 `localization` 或 `navigation`。
@@ -406,7 +403,7 @@ App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两
 
 ### 10.2 可覆盖参数与默认值
 
-`localization`（对应 `courtyard_localization_bringup.launch.py`）：
+`localization`：
 
 | key | 默认值 |
 |---|---|
@@ -418,7 +415,7 @@ App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两
 | `start_scan` | `true` |
 | `start_localization` | `true` |
 
-`navigation`（对应 `courtyard_navigation.launch.py`）：
+`navigation`：
 
 | key | 默认值 |
 |---|---|
@@ -463,6 +460,9 @@ App 必须先订阅 Nav Task 特征值的 Notify 再写入；订阅成功后机�
 
 读取该特征值返回最近一次通知文本（尚无通知时为当前 `STATE ...`）。
 
+`STARTED` 只表示任务已启动；任务内部就绪需要数秒到数十秒，App 不应依据
+`STARTED` 立即假定可以下发导航目标。
+
 ### 10.4 标准交互时序
 
 ```text
@@ -480,24 +480,16 @@ App                                      Robot
  |<------------------ STOPPED navigation -|
 ```
 
-异常示例：任务进程崩溃时机器人主动推送，如
+异常示例：任务异常退出时机器人主动推送，如
 `EXITED navigation 1 [amcl]: map could not be loaded`。
-
-### 10.5 实现注意
-
-- `STARTED` 只表示进程拉起成功；Nav2 内部节点就绪需要数秒到数十秒，App 不应依据
-  `STARTED` 立即假定可以下发导航目标。
-- 桥接进程正常退出（含服务重启）时会先停止仍在运行的任务；桥接崩溃则可能留下孤儿
-  launch 进程。此时再次 `START` 同名任务可能因资源冲突失败，需要人工上机清理残留
-  进程（如结束对应的 `ros2 launch` 进程组）。
 
 ## 11. 区域导航（Zone Nav）
 
 App 可以向 Zone Nav 特征值写入区域名，让机器人导航到四个固定区域之一：
 `charging_zone`（充电区）、`mowing_zone`（割草区）、`pool_zone`（泳池区）、
-`equipment_zone`（设备区）。机器人侧通过共享 rclpy 节点向 ROS2 话题
-`/xiaozhi_topic` 发布一条 `std_msgs/String` 消息（`data` 为区域名），后续的
-导航行为由订阅该话题的模块完成。
+`equipment_zone`（设备区）。机器人侧向 ROS2 话题 `/xiaozhi_topic` 发布一条
+`std_msgs/String` 消息（`data` 为区域名），后续的导航行为由订阅该话题的模块
+完成。
 
 - 写入内容为区域名（UTF-8 文本），只有上述四个合法值；机器人解析时去除首尾
   空白并忽略大小写，发布到话题的 `data` 一律为小写区域名。
@@ -508,14 +500,46 @@ App 可以向 Zone Nav 特征值写入区域名，让机器人导航到四个固
 | `OK <zone>` | 消息已发布到 `/xiaozhi_topic`（`<zone>` 为小写区域名） |
 | `ERR encoding` | 写入内容不是合法 UTF-8 |
 | `ERR command` | 区域名不是四个合法值之一（含空写入） |
-| `ERR unavailable` | 区域导航功能不可用（ROS 环境缺失或功能被禁用） |
+| `ERR unavailable` | 区域导航功能不可用 |
 | `ERR internal` | 机器人内部未能调度命令 |
 
 读取该特征值返回最近一次应答文本（尚无应答时为空）。`OK` 只表示消息已交给
 ROS2 发布者，不表示机器人已开始移动或已到达目标区域；导航进度与到达情况
 不通过 BLE 上报。
 
-## 12. 连接约束
+## 12. 速度控制（Cmd Vel）
+
+App 可以向 Cmd Vel 特征值写入线速度和角速度，直接控制机器人运动。机器人侧
+每收到一次写入，就向 ROS2 话题 `/cmd_vel` 发布一条 `geometry_msgs/Twist`
+消息（`linear.x` 为线速度、`angular.z` 为角速度），后续运动行为由订阅该话题
+的模块（如底盘驱动）完成。
+
+- 写入内容为两个十进制数，以空白分隔：`<linear_x> <angular_z>`
+  （线速度 m/s、角速度 rad/s），例如 `-0.30 0.0`；机器人解析时去除首尾空白。
+- **每次写入发布一条消息**：即使写入的值与上次完全相同也会再次发布，机器人
+  侧不做去重。该特征值面向摇杆式连续控制，App 可按需连续写入；BLE 连接间隔
+  最小 7.5 ms，理论上限约每秒百次量级，实际建议不超过 20-30 Hz。
+- 数值范围与限幅由机器人运动模块负责，本特征值不限制大小；非数字、NaN/Inf、
+  字段个数不对的写入按 `ERR command` 拒绝。
+- 机器人对 `/cmd_vel` 有超时保护：App 停止写入后，超过机器人侧的消息超时
+  时间会自动停车，BLE 断连、App 崩溃等情况同理。超时时间由机器人侧配置
+  决定，不属于本协议范围；App 需要立即停车时仍可显式写入一次 `0 0`，
+  不必等待超时生效。
+- 发布是即发即弃（fire-and-forget），写入的即时应答即最终结果：
+
+| 通知内容 | 含义 |
+|---|---|
+| `OK <linear_x> <angular_z>` | 消息已发布到 `/cmd_vel` |
+| `ERR encoding` | 写入内容不是合法 UTF-8 |
+| `ERR command` | 格式不符或数值非法（含空写入） |
+| `ERR unavailable` | 速度控制功能不可用 |
+| `ERR internal` | 机器人内部未能调度命令 |
+
+读取该特征值返回最近一次应答文本（尚无应答时为空）。`OK` 只表示消息已交给
+ROS2 发布者，不表示机器人已开始运动。连续写入时建议使用 Write Without Response
+并控制写入节奏（见上文 20-30 Hz 的建议），避免超出连接间隔承载能力。
+
+## 13. 连接约束
 
 - 当前版本按单个控制 App 设计，不支持多个 App 同时争用按住说话控制权。
 - 当前版本不定义应用层鉴权、加密载荷或强制 BLE 配对；连接安全由内部测试环境负责。
@@ -523,7 +547,7 @@ ROS2 发布者，不表示机器人已开始移动或已到达目标区域；导
 - App 应设置合理的连接和写入超时。一次写入失败时，应将按钮恢复为未按下状态；若连接仍然
   有效，可以补发一次 `stop`，但不应自动重试 `start`。
 
-## 13. App 实现检查表
+## 14. App 实现检查表
 
 语音控制：
 
@@ -567,11 +591,16 @@ WiFi 配网：
 
 19. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
     更新界面；`START navigation` 前先确认 localization 为 `RUNNING`。
-20. `STARTED` 不代表导航就绪；任务崩溃以 `EXITED` 通知为准提示用户，详情上机查看
-    `~/.cache/xiaozhi-ble/logs/<task>.log`。
+20. `STARTED` 不代表导航就绪；任务异常退出以 `EXITED` 通知为准提示用户。
 
 区域导航：
 
 21. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
     `pool_zone`、`equipment_zone`）；以 `OK <zone>` 确认消息已发布，
     收到 `ERR ...` 时按错误码提示用户。
+
+速度控制：
+
+22. 向 Cmd Vel 特征值写入 `<linear_x> <angular_z>`（如 `-0.30 0.0`）；相同值
+    每次写入都会再次发布。停止写入后机器人会因运动模块的消息超时保护自动
+    停车，需要立即停车时显式写入 `0 0`；收到 `ERR ...` 时按错误码提示用户。

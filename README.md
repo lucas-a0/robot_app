@@ -23,8 +23,8 @@
   `sensor_msgs/BatteryState` 话题（默认 `/battery_state`），上报电量百分比和
   充电状态；ROS2 环境不可用时自动禁用，不影响其余功能。
 - `ros_runtime.py`：共享 rclpy 运行时，持有进程级唯一的 rclpy 上下文、
-  节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control 和 zone_nav
-  都挂载在这个节点上，不各自创建上下文。
+  节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control、zone_nav 和
+  cmd_vel 都挂载在这个节点上，不各自创建上下文。
 - `robot_control.py`：机器人行为控制，把 App 写入的命令名按配置映射为
   `std_srvs/Trigger` 服务并异步调用；成功静默，失败通过特征值 Notify 上报。
 - `network.py`：网络状态获取，直接从内核读取 WiFi 状态（SSID 用 wireless
@@ -48,6 +48,9 @@
 - `zone_nav.py`：区域导航，把 App 写入的四个固定区域名（`charging_zone`、
   `mowing_zone`、`pool_zone`、`equipment_zone`）作为 `std_msgs/String` 发布到
   `/xiaozhi_topic`（共享 rclpy 节点），发布即发即弃，即时应答 `OK <zone>`。
+- `cmd_vel.py`：速度控制，把 App 写入的 `<linear_x> <angular_z>`（线速度
+  m/s、角速度 rad/s）作为 `geometry_msgs/Twist` 发布到 `/cmd_vel`
+  （共享 rclpy 节点）；每次写入发布一条消息，相同值不去重。
 - `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
 - `config.py`：YAML 配置加载。
 
@@ -225,6 +228,26 @@ bash 包装脚本 source ROS2 与工作区环境后 `exec ros2 launch`（launch 
 ```yaml
 zone_nav:
   topic: /xiaozhi_topic     # 区域导航目标话题（std_msgs/String）
+```
+
+### 速度控制
+
+速度控制也是本模块自己的功能。App 向 Cmd Vel 特征值写入
+`<linear_x> <angular_z>`（线速度 m/s、角速度 rad/s，以空白分隔的两个
+十进制数，例如 `-0.30 0.0`），模块在共享 rclpy 节点上向 `cmd_vel.topic`
+配置的话题（默认 `/cmd_vel`）发布一条 `geometry_msgs/Twist` 消息
+（`linear.x` / `angular.z`），后续运动行为由订阅该话题的模块完成。
+每次写入发布一条消息，相同值不去重，面向摇杆式连续控制；数值范围与限幅
+由运动模块负责，本模块只拒绝非数字、NaN/Inf 和字段个数不对的写入。
+发布即发即弃，写入的即时应答即最终结果：成功 `OK <linear_x> <angular_z>`，
+格式非法 `ERR command`，ROS 环境不可用时 `ERR unavailable`。`cmd_vel.topic`
+留空则禁用该功能。
+
+配置示例：
+
+```yaml
+cmd_vel:
+  topic: /cmd_vel           # 速度控制话题（geometry_msgs/Twist）
 ```
 
 ## 依赖安装

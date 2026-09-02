@@ -75,5 +75,13 @@ wifi:
 zone_nav:
   topic: /xiaozhi_topic       # 区域导航目标话题（std_msgs/String）
 
+# 速度控制：App 向 Cmd Vel 特征值写入 "<linear_x> <angular_z>"（线速度 m/s、
+# 角速度 rad/s），本模块通过共享的 rclpy 节点（与 battery 同一个）向该话题
+# 发布 geometry_msgs/Twist 消息（linear.x / angular.z）。每次写入发布一条
+# 消息，相同值不去重，面向摇杆式连续控制。需要 ROS2 环境（同 battery）；
+# 不可用时写入会收到 ERR unavailable。topic 留空则禁用该功能。
+cmd_vel:
+  topic: /cmd_vel             # 速度控制话题（geometry_msgs/Twist）
+
 # 日志级别：trace/debug/info/warn/error
 log_level: info
