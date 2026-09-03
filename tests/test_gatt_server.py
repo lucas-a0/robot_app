@@ -23,6 +23,9 @@ from xiaozhi_ble.gatt_server import ERROR_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import LATENCY_CHAR_UUID
 from xiaozhi_ble.gatt_server import LATENCY_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import LatencyStatusCharacteristic
+from xiaozhi_ble.gatt_server import MEMORY_CHAR_UUID
+from xiaozhi_ble.gatt_server import MEMORY_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import MemoryStatusCharacteristic
 from xiaozhi_ble.gatt_server import URL_CHAR_UUID
 from xiaozhi_ble.gatt_server import URL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH
@@ -237,6 +240,21 @@ def test_cpu_status_characteristic_formats_usage():
     assert bytes(characteristic.Value).decode("utf-8") == "CPU 23.5"
 
     characteristic.update_usage(None)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
+
+
+def test_memory_status_characteristic_formats_usage():
+    characteristic = MemoryStatusCharacteristic()
+    assert characteristic.Flags == ["read", "notify"]
+    assert characteristic.Descriptors == [MEMORY_CHARACTERISTIC_CCCD_PATH]
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
+
+    characteristic.update_usage(2145, 7872, 27.234)
+
+    assert bytes(characteristic.Value).decode("utf-8") == "MEM 2145 7872 27.2"
+
+    characteristic.update_usage(None, None, None)
 
     assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
 
@@ -481,6 +499,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert WIFI_CONFIG_CHAR_UUID in str(managed_objects)
     assert ZONE_NAV_CHAR_UUID in str(managed_objects)
     assert CMD_VEL_CHAR_UUID in str(managed_objects)
+    assert MEMORY_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )
@@ -499,6 +518,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ZONE_NAV_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert MEMORY_CHARACTERISTIC_CCCD_PATH in managed_objects
     command_char = _unpack_properties(
         managed_objects["/org/xiaozhi/ble_app/service0/char0"][
             "org.bluez.GattCharacteristic1"

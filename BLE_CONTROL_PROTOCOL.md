@@ -3,7 +3,7 @@
 本文档定义手机 App 与小智机器人之间的 BLE（Bluetooth Low Energy）控制协议。
 协议用于实现与 Web 页面相同的“按住说话”行为：按钮按下开始收音，按钮松开结束收音。
 
-协议版本：`1.9`
+协议版本：`1.10`
 
 ## 1. 适用范围
 
@@ -35,6 +35,7 @@ Service 内的特征值按功能分为五类，UUID 均为 `12345678-1234-5678-1
 | 任务控制 | Nav Task Characteristic | `abcdefb` | Read、Write、Notify |
 | 任务控制 | Zone Nav Characteristic | `abcdefc` | Read、Write、Notify |
 | 运动控制 | Cmd Vel Characteristic | `abcdefd` | Read、Write、Notify |
+| 状态监测 | Memory Status Characteristic | `abcdefe` | Read、Notify |
 
 广播名称可在机器人侧配置修改。App 应以 Service UUID 识别设备，不应只依赖广播名称。
 
@@ -207,7 +208,7 @@ WebSocket 恢复连接后会通知 `NONE`，App 可据此清除错误提示。Er
 ## 7. 状态监测
 
 状态监测类特征值均为只读（Read、Notify），App 不应写入；订阅成功后立即收到当前
-缓存值，之后按各自的通知策略推送。电池和 CPU 属于机身状态，WiFi 连接、带宽和
+缓存值，之后按各自的通知策略推送。电池、CPU 和内存属于机身状态，WiFi 连接、带宽和
 服务器延迟属于网络状态。
 
 ### 7.1 电池状态（Battery Status）
@@ -285,6 +286,21 @@ App 可以读取或订阅 Latency Status 特征值来获取机器人到对话服
 | `LATENCY -` | 服务器不可达（连接被拒绝或超时） |
 
 示例：`LATENCY 37`、`LATENCY -`、`UNKNOWN`。
+
+### 7.4 内存占用（Memory Status）
+
+App 可以读取或订阅 Memory Status 特征值来获取机器人的整机内存占用。
+
+- 内存占用有瞬时值，订阅后即可收到当前读数（尚未完成首次采样时为 `UNKNOWN`）。
+- 仅在占用率变化达到阈值（默认 1 个百分点）时通知，避免抖动导致频繁推送。
+- 值为 UTF-8 文本，格式为 `MEM <used_mb> <total_mb> <percent>`，三个字段以单个
+  空格分隔：
+  - `used_mb` 为已用内存，整数，单位 MB；
+  - `total_mb` 为总内存，整数，单位 MB；
+  - `percent` 为占用率，0-100 的百分比、保留一位小数。
+- 尚未获取到读数时整个值为 `UNKNOWN`。
+
+示例：`MEM 2145 7872 27.2`、`UNKNOWN`。
 
 ## 8. 机器人行为控制（Robot Control）
 
@@ -574,33 +590,34 @@ ROS2 发布者，不表示机器人已开始运动。连续写入时建议使用
 13. 读取或订阅 Bandwidth Status 特征值；值为 `UNKNOWN` 时显示为速率未知。
 14. 读取或订阅 Latency Status 特征值；`UNKNOWN` 显示为延迟未知，`LATENCY -`
     显示为服务器不可达。
+15. 读取或订阅 Memory Status 特征值；值为 `UNKNOWN` 时显示为内存占用未知。
 
 行为控制：
 
-15. 使用机器人行为控制时，先订阅 Robot Control 特征值的 Notify 再写入命令；
+16. 使用机器人行为控制时，先订阅 Robot Control 特征值的 Notify 再写入命令；
     成功无通知，收到 `ERR ...` 时按错误码提示用户。
 
 WiFi 配网：
 
-16. 配网前先订阅 WiFi Config 特征值的 Notify，写入前协商足够的 MTU。
-17. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
+17. 配网前先订阅 WiFi Config 特征值的 Notify，写入前协商足够的 MTU。
+18. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
     以 `CONNECTED`/`FAILED` 为准更新界面，不要依据 `CONNECTING` 假定连接成功。
-18. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。
+19. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。
 
 导航任务：
 
-19. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
+20. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
     更新界面；`START navigation` 前先确认 localization 为 `RUNNING`。
-20. `STARTED` 不代表导航就绪；任务异常退出以 `EXITED` 通知为准提示用户。
+21. `STARTED` 不代表导航就绪；任务异常退出以 `EXITED` 通知为准提示用户。
 
 区域导航：
 
-21. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
+22. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
     `pool_zone`、`equipment_zone`）；以 `OK <zone>` 确认消息已发布，
     收到 `ERR ...` 时按错误码提示用户。
 
 速度控制：
 
-22. 向 Cmd Vel 特征值写入 `<linear_x> <angular_z>`（如 `-0.30 0.0`）；相同值
+23. 向 Cmd Vel 特征值写入 `<linear_x> <angular_z>`（如 `-0.30 0.0`）；相同值
     每次写入都会再次发布。停止写入后机器人会因运动模块的消息超时保护自动
     停车，需要立即停车时显式写入 `0 0`；收到 `ERR ...` 时按错误码提示用户。

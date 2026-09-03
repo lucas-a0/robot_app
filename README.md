@@ -4,7 +4,7 @@
 
 手机 App 通过 BLE GATT 实现"按住说话"（协议见 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)），
 本模块把 BLE 控制指令转发给对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket，
-把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态回传给 App，
+把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态/CPU/内存占用回传给 App，
 并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下），
 以及启停两个固定的导航 launch 任务（定位 bringup 与 Nav2 导航）、
 向 `/xiaozhi_topic` 发布四个固定区域的导航目标。
@@ -32,6 +32,8 @@
   仅在状态变化时通知；没有无线网卡时自动禁用。
 - `cpu.py`：CPU 使用率获取，周期读取 `/proc/stat` 累计 tick 并计算差分，
   变化超过阈值才通知；启动后首个读数约在一个轮询周期后产生。
+- `memory.py`：内存占用获取，周期读取 `/proc/meminfo` 的 MemTotal /
+  MemAvailable，上报已用/总量（MB）和占用率；变化超过阈值才通知。
 - `bandwidth.py`：WiFi 带宽速率获取，周期读取 `/proc/net/dev` 的累计字节
   计数并计算差分（rx/tx 各多少 KB/s），变化超过阈值才通知；没有无线网卡时
   自动禁用。
@@ -120,6 +122,23 @@ App，避免抖动导致频繁推送。
 
 ```yaml
 cpu:
+  poll_interval_secs: 5
+  notify_threshold: 1.0
+```
+
+### 内存占用
+
+内存占用同样是本模块自己的功能。模块按 `memory.poll_interval_secs`（默认 5 秒）
+周期读取 `/proc/meminfo` 的 `MemTotal` / `MemAvailable`（与 `free` 同源，无子进程
+调用），上报已用内存、总内存（单位 MB）和占用率。占用率有瞬时值，首次采样即可
+产生读数；仅当占用率变化达到 `memory.notify_threshold`（默认 1 个百分点）时才
+通知 App，避免抖动导致频繁推送。`/proc/meminfo` 不可读时自动禁用，App 侧显示
+`UNKNOWN`。
+
+配置示例：
+
+```yaml
+memory:
   poll_interval_secs: 5
   notify_threshold: 1.0
 ```

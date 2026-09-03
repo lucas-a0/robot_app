@@ -34,6 +34,7 @@ WIFI_CONFIG_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefa"
 NAV_TASK_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefb"
 ZONE_NAV_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefc"
 CMD_VEL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefd"
+MEMORY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefe"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
@@ -52,6 +53,7 @@ WIFI_CONFIG_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char9"
 NAV_TASK_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char10"
 ZONE_NAV_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char11"
 CMD_VEL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char12"
+MEMORY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char13"
 CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
 URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
 ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
@@ -67,6 +69,7 @@ WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH = f"{WIFI_CONFIG_CHARACTERISTIC_PATH}/desc0
 NAV_TASK_CHARACTERISTIC_CCCD_PATH = f"{NAV_TASK_CHARACTERISTIC_PATH}/desc0"
 ZONE_NAV_CHARACTERISTIC_CCCD_PATH = f"{ZONE_NAV_CHARACTERISTIC_PATH}/desc0"
 CMD_VEL_CHARACTERISTIC_CCCD_PATH = f"{CMD_VEL_CHARACTERISTIC_PATH}/desc0"
+MEMORY_CHARACTERISTIC_CCCD_PATH = f"{MEMORY_CHARACTERISTIC_PATH}/desc0"
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
 # Receives (command, reason), returns the response text relayed to the App,
@@ -1166,6 +1169,76 @@ class CmdVelCharacteristic(InterfaceTemplate):
         logger.debug(f"Sent BLE cmd-vel notification: {text!r}")
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class MemoryStatusCharacteristic(InterfaceTemplate):
+    """Publish whole-machine memory occupancy; notify only on change."""
+
+    def __init__(self) -> None:
+        super().__init__(self)
+        self._flags = ["read", "notify"]
+        self._notifying = False
+        # UNKNOWN until the memory provider delivers its first reading.
+        self._value: List[Byte] = list(b"UNKNOWN")
+
+    @property
+    def UUID(self) -> Str:
+        return MEMORY_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [MEMORY_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        return _read_bytes(self._value, options)
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+        self._notify()
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def update_usage(
+        self,
+        used_mb: int | None,
+        total_mb: int | None,
+        percent: float | None,
+        notify: bool = True,
+    ) -> None:
+        text = (
+            "UNKNOWN"
+            if used_mb is None or total_mb is None or percent is None
+            else f"MEM {used_mb} {total_mb} {percent:.1f}"
+        )
+        self._value = list(_bounded_text(text).encode("utf-8"))
+        if notify and self._notifying:
+            self._notify()
+
+    def _notify(self) -> None:
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", self._value)},
+                [],
+            )
+        except Exception:
+            logger.exception("Failed to emit BLE memory notification")
+            return
+        logger.debug(f"Sent BLE memory usage: {bytes(self._value)!r}")
+
+
 @dbus_interface("org.bluez.GattDescriptor1")
 class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
     """Expose the standard descriptor clients write to enable notifications."""
@@ -1242,6 +1315,7 @@ class ControlService(InterfaceTemplate):
             NAV_TASK_CHARACTERISTIC_PATH,
             ZONE_NAV_CHARACTERISTIC_PATH,
             CMD_VEL_CHARACTERISTIC_PATH,
+            MEMORY_CHARACTERISTIC_PATH,
         ]
 
 
@@ -1316,6 +1390,7 @@ class GattApplication(InterfaceTemplate):
                             NAV_TASK_CHARACTERISTIC_PATH,
                             ZONE_NAV_CHARACTERISTIC_PATH,
                             CMD_VEL_CHARACTERISTIC_PATH,
+                            MEMORY_CHARACTERISTIC_PATH,
                         ],
                     ),
                 }
@@ -1443,6 +1518,14 @@ class GattApplication(InterfaceTemplate):
                     ),
                 }
             },
+            MEMORY_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", MEMORY_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "notify"]),
+                    "Descriptors": Variant("ao", [MEMORY_CHARACTERISTIC_CCCD_PATH]),
+                }
+            },
             CHARACTERISTIC_CCCD_PATH: {
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
@@ -1534,6 +1617,13 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
+            MEMORY_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", MEMORY_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
         }
 
 
@@ -1605,6 +1695,7 @@ class BleControlServer:
         self._nav_task_characteristic: NavTaskCharacteristic | None = None
         self._zone_nav_characteristic: ZoneNavCharacteristic | None = None
         self._cmd_vel_characteristic: CmdVelCharacteristic | None = None
+        self._memory_characteristic: MemoryStatusCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1705,6 +1796,23 @@ class BleControlServer:
         def update() -> bool:
             if self._cpu_characteristic is not None:
                 self._cpu_characteristic.update_usage(usage)
+            return False
+
+        GLib.idle_add(update)
+
+    def notify_memory_usage(
+        self,
+        used_mb: int,
+        total_mb: int,
+        percent: float,
+    ) -> None:
+        """Update the memory occupancy from any thread (notifies on change)."""
+        if self._memory_characteristic is None:
+            return
+
+        def update() -> bool:
+            if self._memory_characteristic is not None:
+                self._memory_characteristic.update_usage(used_mb, total_mb, percent)
             return False
 
         GLib.idle_add(update)
@@ -1823,6 +1931,7 @@ class BleControlServer:
             self._cmd_vel_characteristic = CmdVelCharacteristic(
                 self._cmd_vel_callback
             )
+            self._memory_characteristic = MemoryStatusCharacteristic()
             command_cccd = ClientCharacteristicConfigurationDescriptor(
                 CHARACTERISTIC_PATH,
                 self._characteristic.StartNotify,
@@ -1887,6 +1996,11 @@ class BleControlServer:
                 CMD_VEL_CHARACTERISTIC_PATH,
                 self._cmd_vel_characteristic.StartNotify,
                 self._cmd_vel_characteristic.StopNotify,
+            )
+            memory_cccd = ClientCharacteristicConfigurationDescriptor(
+                MEMORY_CHARACTERISTIC_PATH,
+                self._memory_characteristic.StartNotify,
+                self._memory_characteristic.StopNotify,
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -1968,6 +2082,11 @@ class BleControlServer:
             self._bus.publish_object(
                 CMD_VEL_CHARACTERISTIC_CCCD_PATH, cmd_vel_cccd
             )
+            self._bus.publish_object(
+                MEMORY_CHARACTERISTIC_PATH,
+                self._memory_characteristic,
+            )
+            self._bus.publish_object(MEMORY_CHARACTERISTIC_CCCD_PATH, memory_cccd)
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)
 

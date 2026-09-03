@@ -28,6 +28,7 @@ from .control_client import ControlClient, ControlRequestError, ControlUnavailab
 from .cpu import CpuProvider
 from .gatt_server import BleControlServer, BridgeError
 from .latency import LatencyProvider
+from .memory import MemoryProvider
 from .nav_tasks import NavTaskManager
 from .network import NetworkProvider
 from .robot_control import RobotControl
@@ -103,6 +104,12 @@ class _Bridge:
             poll_interval_secs=config.cpu_poll_interval_secs,
             notify_threshold=config.cpu_notify_threshold,
         )
+        # Memory occupancy: read /proc/meminfo (instantaneous used/total).
+        self._memory_provider = MemoryProvider(
+            on_usage=self._server.notify_memory_usage,
+            poll_interval_secs=config.memory_poll_interval_secs,
+            notify_threshold=config.memory_notify_threshold,
+        )
         # WiFi throughput: /proc/net/dev byte-counter deltas on the same
         # interface as the network provider.
         self._bandwidth_provider = BandwidthProvider(
@@ -146,6 +153,7 @@ class _Bridge:
                 self._cmd_vel.start(node)
         self._network_provider.start()
         self._cpu_provider.start()
+        self._memory_provider.start()
         self._bandwidth_provider.start()
         self._latency_provider.start()
         if self._server.start():
@@ -159,6 +167,7 @@ class _Bridge:
         logger.error(f"Failed to start BLE control: {self._server.error}")
         self._latency_provider.stop()
         self._bandwidth_provider.stop()
+        self._memory_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
         self._zone_nav.stop()
@@ -179,6 +188,7 @@ class _Bridge:
         self._nav_tasks.stop_all()
         self._latency_provider.stop()
         self._bandwidth_provider.stop()
+        self._memory_provider.stop()
         self._cpu_provider.stop()
         self._network_provider.stop()
         # Detach the ROS-backed features before shutting down the shared

@@ -15,8 +15,8 @@
 
 按优先级选择替代方案：
 
-1. **内核接口直接读**：`/proc/stat`（CPU）、`/proc/net/wireless`（信号强度）、
-   ioctl（如 `SIOCGIWESSID` 取 SSID）。
+1. **内核接口直接读**：`/proc/stat`（CPU）、`/proc/meminfo`（内存）、
+   `/proc/net/wireless`（信号强度）、ioctl（如 `SIOCGIWESSID` 取 SSID）。
 2. **成熟库**：netifaces（IP 地址）、dasbus（BlueZ 与 NetworkManager 的
    D-Bus 接口）。
 3. **订阅/调用而非轮询**：ROS2 数据用内置 rclpy 节点订阅话题或调用服务
@@ -34,7 +34,7 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
 
 ## 2. Provider 模式（数据采集模块）
 
-`network.py` / `cpu.py` / `bandwidth.py` / `latency.py` 遵循同一套模式，新增
+`network.py` / `cpu.py` / `memory.py` / `bandwidth.py` / `latency.py` 遵循同一套模式，新增
 数据源时请照抄：
 
 - 独立线程 + `threading.Event` 停止信号；`start()` 幂等、`stop(timeout)` 可join。
@@ -85,7 +85,7 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
 - 测试**不依赖真实硬件/服务**：GATT 测试只构造 D-Bus 接口对象；rclpy 用
   `sys.modules` 注入假模块（见 `tests/test_battery.py`）；内核接口读取函数
   设计为模块级函数 + 可注入路径，测试用 monkeypatch 替换
-  （见 `tests/test_network.py` / `tests/test_cpu.py`）。
+  （见 `tests/test_network.py` / `tests/test_cpu.py` / `tests/test_memory.py`）。
 - 新 provider 必测：解析函数（含坏输入）、变化去重逻辑、禁用路径、线程启停。
 
 ## 6. 依赖与环境

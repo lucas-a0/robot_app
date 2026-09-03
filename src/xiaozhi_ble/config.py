@@ -109,6 +109,27 @@ class BridgeConfig:
         return 1.0
 
     @property
+    def memory_poll_interval_secs(self) -> float:
+        try:
+            value = self._get_nested("memory.poll_interval_secs")
+        except KeyError:
+            return 5.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 5.0
+
+    @property
+    def memory_notify_threshold(self) -> float:
+        """Minimum memory occupancy change (percentage points) that triggers a notify."""
+        try:
+            value = self._get_nested("memory.notify_threshold")
+        except KeyError:
+            return 1.0
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+        return 1.0
+
+    @property
     def bandwidth_poll_interval_secs(self) -> float:
         try:
             value = self._get_nested("bandwidth.poll_interval_secs")

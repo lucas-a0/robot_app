@@ -33,6 +33,13 @@ cpu:
   poll_interval_secs: 5         # 轮询周期（秒）
   notify_threshold: 1.0         # 变化达到多少个百分点才通知 App
 
+# 内存占用上报，周期读取 /proc/meminfo 的 MemTotal / MemAvailable
+# （无子进程调用）。占用率有瞬时值，首次采样即可上报；仅当占用率变化达到
+# memory.notify_threshold（默认 1 个百分点）时才通知 App。
+memory:
+  poll_interval_secs: 5         # 轮询周期（秒）
+  notify_threshold: 1.0         # 变化达到多少个百分点才通知 App
+
 # WiFi 带宽速率上报，周期读取 /proc/net/dev 的累计收发字节并计算差分（KB/s）。
 # 监控的网卡与 network.interface 一致（留空自动探测）；没有无线网卡时自动禁用，
 # App 侧显示 UNKNOWN。首次采样只建立基线，首个读数约在一个轮询周期后产生。
