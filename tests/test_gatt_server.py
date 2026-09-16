@@ -44,6 +44,9 @@ from xiaozhi_ble.gatt_server import WebsocketUrlCharacteristic
 from xiaozhi_ble.gatt_server import ZONE_NAV_CHAR_UUID
 from xiaozhi_ble.gatt_server import ZONE_NAV_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import ZoneNavCharacteristic
+from xiaozhi_ble.gatt_server import ZONE_VOICE_CHAR_UUID
+from xiaozhi_ble.gatt_server import ZONE_VOICE_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import ZoneVoiceCharacteristic
 
 
 def _value(characteristic: CommandCharacteristic) -> str:
@@ -376,6 +379,62 @@ def test_zone_nav_characteristic_dispatches_zones():
     assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
 
 
+def test_zone_voice_characteristic_dispatches_commands():
+    calls = []
+
+    def callback(text: str) -> str:
+        calls.append(text)
+        if text.lower() == "status":
+            return "IDLE"
+        if text.lower() == "list":
+            return "LIST pool_zone.mp3"
+        if text.lower().startswith("play "):
+            return f"PLAYING {text.split(None, 1)[1]}"
+        if text.lower() == "stop":
+            return "IDLE"
+        return "ERR command"
+
+    characteristic = ZoneVoiceCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [ZONE_VOICE_CHARACTERISTIC_CCCD_PATH]
+    # Construction queries the current status for the cached value.
+    assert calls == ["status"]
+    assert bytes(characteristic.Value).decode("utf-8") == "IDLE"
+
+    characteristic.StartNotify()
+    assert calls[-1] == "status"
+    assert bytes(characteristic.Value).decode("utf-8") == "IDLE"
+
+    characteristic.WriteValue(list(b"  LIST \n"), {})
+    assert calls[-1] == "LIST"
+    assert bytes(characteristic.Value).decode("utf-8") == "LIST pool_zone.mp3"
+
+    characteristic.WriteValue(list(b"PLAY Pool_Zone.mp3"), {})
+    assert calls[-1] == "PLAY Pool_Zone.mp3"
+    assert bytes(characteristic.Value).decode("utf-8") == "PLAYING Pool_Zone.mp3"
+
+    characteristic.WriteValue(list(b"STOP"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "IDLE"
+
+    characteristic.WriteValue(list(b"pause"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    characteristic.WriteValue([0xFF], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    characteristic.WriteValue(list(b"  "), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    def broken(text: str) -> str:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = ZoneVoiceCharacteristic(broken)
+    # Construction already swallowed the status query exception.
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"LIST"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_cmd_vel_characteristic_dispatches_velocities():
     calls = []
 
@@ -500,6 +559,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert ZONE_NAV_CHAR_UUID in str(managed_objects)
     assert CMD_VEL_CHAR_UUID in str(managed_objects)
     assert MEMORY_CHAR_UUID in str(managed_objects)
+    assert ZONE_VOICE_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )

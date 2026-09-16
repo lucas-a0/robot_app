@@ -34,7 +34,7 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
 
 ## 2. Provider 模式（数据采集模块）
 
-`network.py` / `cpu.py` / `memory.py` / `bandwidth.py` / `latency.py` 遵循同一套模式，新增
+`network.py` / `cpu.py` / `memory.py` / `bandwidth.py` / `latency.py` / `zone_voice.py` 遵循同一套模式，新增
 数据源时请照抄：
 
 - 独立线程 + `threading.Event` 停止信号；`start()` 幂等、`stop(timeout)` 可join。
@@ -59,6 +59,12 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
   需要在 `gatt_server.py` 里同步登记四处——常量区、特征值类、
   `ControlService.Characteristics`、`GattApplication.GetManagedObjects`，
   以及 `_run()` 里的创建/CCCD/发布。
+  **尾号已用尽**：`abcdef0`–`abcdeff` 均已占用（Zone Voice 为 `abcdeff` /
+  `char14`）。再新增特征值必须换 UUID 方案（例如最后一组改为
+  `56789abcd010`），不要把 UUID 最后一组扩成 13 个十六进制字符。
+- BLE 对 App 保持纯文本；下游本机协议可以是 JSON Lines（如
+  `zone_voice.py` 对接 `zone_voice_player`），翻译发生在桥接模块内部，
+  不得把 JSON 包装泄漏到 GATT 特征值。
 - 跨线程更新特征值必须走 `GLib.idle_add`（GATT 对象属于 GLib 事件循环线程）。
 
 ## 4. 文档同步（改代码必查）

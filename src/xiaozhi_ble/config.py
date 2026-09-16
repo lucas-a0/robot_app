@@ -73,6 +73,30 @@ class BridgeConfig:
         return self._str("cmd_vel.topic", "/cmd_vel")
 
     @property
+    def zone_voice_socket_path(self) -> str:
+        return self._str("zone_voice.socket_path", "/tmp/zone_voice_player.sock")
+
+    @property
+    def zone_voice_request_timeout_secs(self) -> float:
+        try:
+            value = self._get_nested("zone_voice.request_timeout_secs")
+        except KeyError:
+            return 2.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 2.0
+
+    @property
+    def zone_voice_poll_interval_secs(self) -> float:
+        try:
+            value = self._get_nested("zone_voice.poll_interval_secs")
+        except KeyError:
+            return 1.0
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return 1.0
+
+    @property
     def network_interface(self) -> str:
         """WiFi interface name; empty means auto-detect the first wlan*."""
         return self._str("network.interface", "")

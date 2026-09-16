@@ -35,6 +35,7 @@ from .robot_control import RobotControl
 from .ros_runtime import RosRuntime
 from .wifi_config import WifiConfigurator
 from .zone_nav import ZoneNavigator
+from .zone_voice import ZoneVoiceController
 
 
 class _Bridge:
@@ -54,6 +55,15 @@ class _Bridge:
         # as geometry_msgs/Twist on the configured topic from the shared ROS
         # runtime node; every write publishes exactly one message (no dedup).
         self._cmd_vel = CmdVelPublisher(topic=config.cmd_vel_topic)
+        # Zone voice: BLE LIST/PLAY/STOP/STATUS writes are translated into
+        # JSON Lines requests against zone_voice_player; status changes
+        # (natural end, ROS-triggered playback) come back through notify.
+        self._zone_voice = ZoneVoiceController(
+            socket_path=config.zone_voice_socket_path,
+            on_notify=self._forward_zone_voice_event,
+            request_timeout_secs=config.zone_voice_request_timeout_secs,
+            poll_interval_secs=config.zone_voice_poll_interval_secs,
+        )
         self._server = BleControlServer(
             callback=self._handle_command,
             url_callback=self._handle_url_update,
@@ -68,6 +78,7 @@ class _Bridge:
             nav_task_callback=self._nav_tasks.execute,
             zone_nav_callback=self._zone_nav.execute,
             cmd_vel_callback=self._cmd_vel.execute,
+            zone_voice_callback=self._zone_voice.execute,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
@@ -156,6 +167,7 @@ class _Bridge:
         self._memory_provider.start()
         self._bandwidth_provider.start()
         self._latency_provider.start()
+        self._zone_voice.start()
         if self._server.start():
             # The client may have connected before the GATT server was up, in
             # which case the "connected" callback was dropped; sync the error
@@ -165,6 +177,7 @@ class _Bridge:
                 self._sync_websocket_url()
             return True
         logger.error(f"Failed to start BLE control: {self._server.error}")
+        self._zone_voice.stop()
         self._latency_provider.stop()
         self._bandwidth_provider.stop()
         self._memory_provider.stop()
@@ -186,6 +199,7 @@ class _Bridge:
         # Then stop any running navigation launch tasks (SIGINT the process
         # groups, SIGKILL whatever ignores it).
         self._nav_tasks.stop_all()
+        self._zone_voice.stop()
         self._latency_provider.stop()
         self._bandwidth_provider.stop()
         self._memory_provider.stop()
@@ -212,6 +226,10 @@ class _Bridge:
     def _forward_nav_task_event(self, text: str) -> None:
         """Relay an asynchronous nav-task event (STOPPED/EXITED) to the App."""
         self._server.notify_nav_task(text)
+
+    def _forward_zone_voice_event(self, text: str) -> None:
+        """Relay a zone-voice status change (PLAYING/IDLE/UNKNOWN) to the App."""
+        self._server.notify_zone_voice(text)
 
     def _publish_wifi_result(self, code: str, ssid: str) -> None:
         """Relay the asynchronous provisioning outcome to the App."""

@@ -7,7 +7,8 @@
 把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态/CPU/内存占用回传给 App，
 并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下），
 以及启停两个固定的导航 launch 任务（定位 bringup 与 Nav2 导航）、
-向 `/xiaozhi_topic` 发布四个固定区域的导航目标。
+向 `/xiaozhi_topic` 发布四个固定区域的导航目标、
+通过 Unix socket 控制区域语音播放器列出/播放/停止提示音。
 
 ```text
 手机 App  <-- BLE GATT -->  xiaozhi-ble（本模块）  <-- Unix socket -->  xiaozhi 对话模块
@@ -53,6 +54,10 @@
 - `cmd_vel.py`：速度控制，把 App 写入的 `<linear_x> <angular_z>`（线速度
   m/s、角速度 rad/s）作为 `geometry_msgs/Twist` 发布到 `/cmd_vel`
   （共享 rclpy 节点）；每次写入发布一条消息，相同值不去重。
+- `zone_voice.py`：区域语音播放，把 App 写入的 LIST/PLAY/STOP/STATUS 翻译为
+  zone_voice_player 的 JSON Lines Unix socket 请求；按周期查询播放状态，
+  仅变化时 Notify（含机器人自行触发的播放与自然结束）。播放器未运行时
+  自动降级。
 - `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
 - `config.py`：YAML 配置加载。
 
@@ -267,6 +272,26 @@ zone_nav:
 ```yaml
 cmd_vel:
   topic: /cmd_vel           # 速度控制话题（geometry_msgs/Twist）
+```
+
+### 区域语音播放
+
+区域语音播放同样是本模块自己的功能。App 向 Zone Voice 特征值写入
+`LIST` / `PLAY <file>` / `STOP` / `STATUS`（纯文本，文件名与 `LIST` 返回的
+完全一致），模块作为 JSON Lines 客户端连接 `zone_voice_player` 暴露的 Unix
+socket（默认 `/tmp/zone_voice_player.sock`），把请求转过去并把应答映射为
+`LIST ...` / `PLAYING <file>` / `IDLE` / `ERR ...`。播放状态按
+`zone_voice.poll_interval_secs`（默认 1 秒）轮询，仅变化时 Notify，因此
+机器人自行触发的播放和音频自然结束 App 也能看到。`socket_path` 留空则禁用；
+播放器未运行时 `LIST`/`PLAY`/`STOP` 回复 `ERR unavailable`，状态为 `UNKNOWN`。
+
+配置示例：
+
+```yaml
+zone_voice:
+  socket_path: /tmp/zone_voice_player.sock
+  request_timeout_secs: 2.0
+  poll_interval_secs: 1.0
 ```
 
 ## 依赖安装

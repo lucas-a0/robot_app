@@ -90,5 +90,14 @@ zone_nav:
 cmd_vel:
   topic: /cmd_vel             # 速度控制话题（geometry_msgs/Twist）
 
+# 区域语音播放：App 向 Zone Voice 特征值写入 LIST / PLAY <file> / STOP / STATUS，
+# 本模块作为 JSON Lines 客户端连接 zone_voice_player 的 Unix socket。
+# socket_path 留空则禁用；播放器未运行时 LIST/PLAY/STOP 回复 ERR unavailable，
+# 状态为 UNKNOWN。播放状态按 poll_interval_secs 轮询，仅变化时 Notify。
+zone_voice:
+  socket_path: /tmp/zone_voice_player.sock
+  request_timeout_secs: 2.0   # 单次 socket 请求超时（秒）
+  poll_interval_secs: 1.0     # 播放状态轮询周期（秒）
+
 # 日志级别：trace/debug/info/warn/error
 log_level: info

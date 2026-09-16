@@ -35,6 +35,7 @@ NAV_TASK_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefb"
 ZONE_NAV_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefc"
 CMD_VEL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefd"
 MEMORY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefe"
+ZONE_VOICE_CHAR_UUID = "12345678-1234-5678-1234-56789abcdeff"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
@@ -54,6 +55,7 @@ NAV_TASK_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char10"
 ZONE_NAV_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char11"
 CMD_VEL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char12"
 MEMORY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char13"
+ZONE_VOICE_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char14"
 CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
 URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
 ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
@@ -70,6 +72,7 @@ NAV_TASK_CHARACTERISTIC_CCCD_PATH = f"{NAV_TASK_CHARACTERISTIC_PATH}/desc0"
 ZONE_NAV_CHARACTERISTIC_CCCD_PATH = f"{ZONE_NAV_CHARACTERISTIC_PATH}/desc0"
 CMD_VEL_CHARACTERISTIC_CCCD_PATH = f"{CMD_VEL_CHARACTERISTIC_PATH}/desc0"
 MEMORY_CHARACTERISTIC_CCCD_PATH = f"{MEMORY_CHARACTERISTIC_PATH}/desc0"
+ZONE_VOICE_CHARACTERISTIC_CCCD_PATH = f"{ZONE_VOICE_CHARACTERISTIC_PATH}/desc0"
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
 # Receives (command, reason), returns the response text relayed to the App,
@@ -96,6 +99,9 @@ ZoneNavCallback = Callable[[str], str]
 # reply relayed to the App (e.g. "OK -0.3 0.0" or "ERR command"); every write
 # publishes exactly one Twist, repeated values included.
 CmdVelCallback = Callable[[str], str]
+# Receives the raw Zone Voice write text, returns the immediate reply relayed
+# to the App (e.g. "PLAYING pool_zone.mp3", "LIST ...", or "ERR command").
+ZoneVoiceCallback = Callable[[str], str]
 
 
 class BridgeError(Exception):
@@ -1239,6 +1245,97 @@ class MemoryStatusCharacteristic(InterfaceTemplate):
         logger.debug(f"Sent BLE memory usage: {bytes(self._value)!r}")
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class ZoneVoiceCharacteristic(InterfaceTemplate):
+    """Receive zone-voice commands and notify replies and status changes."""
+
+    def __init__(self, callback: ZoneVoiceCallback) -> None:
+        super().__init__(self)
+        self._callback = callback
+        self._flags = ["read", "write", "notify"]
+        self._notifying = False
+        try:
+            initial = callback("status")
+        except Exception:
+            logger.exception("Failed to query initial zone-voice status")
+            initial = "UNKNOWN"
+        self._value: List[Byte] = list(initial.encode("utf-8"))
+
+    @property
+    def UUID(self) -> Str:
+        return ZONE_VOICE_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [ZONE_VOICE_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        """Return the most recently published reply or status."""
+        return _read_bytes(self._value, options)
+
+    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
+        """Handle a UTF-8 LIST/PLAY/STOP/STATUS zone-voice command."""
+        try:
+            text = bytes(value).decode("utf-8").strip()
+        except UnicodeDecodeError:
+            self._notify("ERR encoding")
+            return
+
+        logger.info(f"Received BLE zone-voice command: {text!r}")
+        if not text:
+            self._notify("ERR command")
+            return
+        try:
+            reply = self._callback(text)
+        except Exception:
+            logger.exception("Failed to dispatch BLE zone-voice command")
+            self._notify("ERR internal")
+            return
+        self._notify(reply)
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+        try:
+            self._notify(self._callback("status"))
+        except Exception:
+            logger.exception("Failed to query zone-voice status for notification")
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def report(self, text: str) -> None:
+        """Publish an asynchronous status change (PLAYING/IDLE/UNKNOWN)."""
+        self._notify(text)
+
+    def _notify(self, text: str) -> None:
+        data = list(_bounded_text(text).encode("utf-8"))
+        self._value = data
+        if not self._notifying:
+            return
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", data)},
+                [],
+            )
+        except Exception:
+            logger.exception(f"Failed to emit BLE zone-voice notification: {text!r}")
+            return
+        logger.debug(f"Sent BLE zone-voice notification: {text!r}")
+
+
 @dbus_interface("org.bluez.GattDescriptor1")
 class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
     """Expose the standard descriptor clients write to enable notifications."""
@@ -1316,6 +1413,7 @@ class ControlService(InterfaceTemplate):
             ZONE_NAV_CHARACTERISTIC_PATH,
             CMD_VEL_CHARACTERISTIC_PATH,
             MEMORY_CHARACTERISTIC_PATH,
+            ZONE_VOICE_CHARACTERISTIC_PATH,
         ]
 
 
@@ -1391,6 +1489,7 @@ class GattApplication(InterfaceTemplate):
                             ZONE_NAV_CHARACTERISTIC_PATH,
                             CMD_VEL_CHARACTERISTIC_PATH,
                             MEMORY_CHARACTERISTIC_PATH,
+                            ZONE_VOICE_CHARACTERISTIC_PATH,
                         ],
                     ),
                 }
@@ -1526,6 +1625,16 @@ class GattApplication(InterfaceTemplate):
                     "Descriptors": Variant("ao", [MEMORY_CHARACTERISTIC_CCCD_PATH]),
                 }
             },
+            ZONE_VOICE_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", ZONE_VOICE_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "write", "notify"]),
+                    "Descriptors": Variant(
+                        "ao", [ZONE_VOICE_CHARACTERISTIC_CCCD_PATH]
+                    ),
+                }
+            },
             CHARACTERISTIC_CCCD_PATH: {
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
@@ -1624,6 +1733,13 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
+            ZONE_VOICE_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", ZONE_VOICE_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
         }
 
 
@@ -1645,6 +1761,7 @@ class BleControlServer:
         nav_task_callback: NavTaskCallback | None = None,
         zone_nav_callback: ZoneNavCallback | None = None,
         cmd_vel_callback: CmdVelCallback | None = None,
+        zone_voice_callback: ZoneVoiceCallback | None = None,
     ) -> None:
         self._callback = callback
         self._url_callback = url_callback or (lambda _url: None)
@@ -1663,6 +1780,13 @@ class BleControlServer:
         self._cmd_vel_callback = cmd_vel_callback or (
             lambda _text: "ERR unavailable"
         )
+        def _unavailable_zone_voice(text: str) -> str:
+            verb = text.strip().split(None, 1)[0].lower() if text.strip() else ""
+            if verb == "status":
+                return "UNKNOWN"
+            return "ERR unavailable"
+
+        self._zone_voice_callback = zone_voice_callback or _unavailable_zone_voice
         self._adapter_path = adapter_path
         self._device_name = device_name
         self._initial_state = initial_state
@@ -1696,6 +1820,7 @@ class BleControlServer:
         self._zone_nav_characteristic: ZoneNavCharacteristic | None = None
         self._cmd_vel_characteristic: CmdVelCharacteristic | None = None
         self._memory_characteristic: MemoryStatusCharacteristic | None = None
+        self._zone_voice_characteristic: ZoneVoiceCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1894,6 +2019,18 @@ class BleControlServer:
 
         GLib.idle_add(update)
 
+    def notify_zone_voice(self, text: str) -> None:
+        """Publish an asynchronous zone-voice status change from any thread."""
+        if self._zone_voice_characteristic is None:
+            return
+
+        def update() -> bool:
+            if self._zone_voice_characteristic is not None:
+                self._zone_voice_characteristic.report(text)
+            return False
+
+        GLib.idle_add(update)
+
     def _run(self) -> None:
         try:
             self._bus = SystemMessageBus()
@@ -1932,6 +2069,9 @@ class BleControlServer:
                 self._cmd_vel_callback
             )
             self._memory_characteristic = MemoryStatusCharacteristic()
+            self._zone_voice_characteristic = ZoneVoiceCharacteristic(
+                self._zone_voice_callback
+            )
             command_cccd = ClientCharacteristicConfigurationDescriptor(
                 CHARACTERISTIC_PATH,
                 self._characteristic.StartNotify,
@@ -2001,6 +2141,11 @@ class BleControlServer:
                 MEMORY_CHARACTERISTIC_PATH,
                 self._memory_characteristic.StartNotify,
                 self._memory_characteristic.StopNotify,
+            )
+            zone_voice_cccd = ClientCharacteristicConfigurationDescriptor(
+                ZONE_VOICE_CHARACTERISTIC_PATH,
+                self._zone_voice_characteristic.StartNotify,
+                self._zone_voice_characteristic.StopNotify,
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -2087,6 +2232,13 @@ class BleControlServer:
                 self._memory_characteristic,
             )
             self._bus.publish_object(MEMORY_CHARACTERISTIC_CCCD_PATH, memory_cccd)
+            self._bus.publish_object(
+                ZONE_VOICE_CHARACTERISTIC_PATH,
+                self._zone_voice_characteristic,
+            )
+            self._bus.publish_object(
+                ZONE_VOICE_CHARACTERISTIC_CCCD_PATH, zone_voice_cccd
+            )
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)
 
