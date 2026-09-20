@@ -73,6 +73,10 @@ class BridgeConfig:
         return self._str("cmd_vel.topic", "/cmd_vel")
 
     @property
+    def initial_pose_topic(self) -> str:
+        return self._str("initial_pose.topic", "/initialpose")
+
+    @property
     def zone_voice_socket_path(self) -> str:
         return self._str("zone_voice.socket_path", "/tmp/zone_voice_player.sock")
 

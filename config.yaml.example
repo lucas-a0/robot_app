@@ -90,6 +90,15 @@ zone_nav:
 cmd_vel:
   topic: /cmd_vel             # 速度控制话题（geometry_msgs/Twist）
 
+# 初始位姿设置（重新定位）：App 向 Initial Pose 特征值写入任意非空内容
+# （如 "1"），本模块通过共享的 rclpy 节点（与 battery 同一个）向该话题发布
+# 一条参数写死的 geometry_msgs/PoseWithCovarianceStamped 消息（map 坐标系，
+# 位姿与协方差硬编码在 initial_pose.py，本配置不可调）。写入内容本身无含义，
+# 只是触发信号；每次写入发布一条消息，不去重。需要 ROS2 环境（同 battery）；
+# 不可用时写入会收到 ERR unavailable。topic 留空则禁用该功能。
+initial_pose:
+  topic: /initialpose         # 初始位姿话题（PoseWithCovarianceStamped）
+
 # 区域语音播放：App 向 Zone Voice 特征值写入 LIST / PLAY <file> / STOP / STATUS，
 # 本模块作为 JSON Lines 客户端连接 zone_voice_player 的 Unix socket。
 # socket_path 留空则禁用；播放器未运行时 LIST/PLAY/STOP 回复 ERR unavailable，

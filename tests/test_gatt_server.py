@@ -36,6 +36,9 @@ from xiaozhi_ble.gatt_server import ControlAdvertisement
 from xiaozhi_ble.gatt_server import CpuStatusCharacteristic
 from xiaozhi_ble.gatt_server import ErrorCharacteristic
 from xiaozhi_ble.gatt_server import GattApplication
+from xiaozhi_ble.gatt_server import INITIAL_POSE_CHAR_UUID
+from xiaozhi_ble.gatt_server import INITIAL_POSE_CHARACTERISTIC_CCCD_PATH
+from xiaozhi_ble.gatt_server import InitialPoseCharacteristic
 from xiaozhi_ble.gatt_server import NetworkStatusCharacteristic
 from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHAR_UUID
 from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH
@@ -475,6 +478,41 @@ def test_cmd_vel_characteristic_dispatches_velocities():
     assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
 
 
+def test_initial_pose_characteristic_dispatches_triggers():
+    calls = []
+
+    def callback(text: str) -> str:
+        calls.append(text)
+        return "OK"
+
+    characteristic = InitialPoseCharacteristic(callback)
+    assert characteristic.Flags == ["read", "write", "notify"]
+    assert characteristic.Descriptors == [INITIAL_POSE_CHARACTERISTIC_CCCD_PATH]
+
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b" 1 \n"), {})
+    assert calls == ["1"]
+    assert bytes(characteristic.Value).decode("utf-8") == "OK"
+
+    # Any non-empty payload triggers; the text itself is not interpreted.
+    characteristic.WriteValue(list(b"reset"), {})
+    assert calls == ["1", "reset"]
+
+    characteristic.WriteValue([0xff], {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR encoding"
+
+    characteristic.WriteValue(list(b"  "), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR command"
+
+    def broken(text: str) -> str:
+        raise RuntimeError("dispatch blew up")
+
+    characteristic = InitialPoseCharacteristic(broken)
+    characteristic.StartNotify()
+    characteristic.WriteValue(list(b"1"), {})
+    assert bytes(characteristic.Value).decode("utf-8") == "ERR internal"
+
+
 def test_wifi_config_characteristic_dispatches_requests():
     calls = []
 
@@ -560,6 +598,7 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert CMD_VEL_CHAR_UUID in str(managed_objects)
     assert MEMORY_CHAR_UUID in str(managed_objects)
     assert ZONE_VOICE_CHAR_UUID in str(managed_objects)
+    assert INITIAL_POSE_CHAR_UUID in str(managed_objects)
     command_cccd = _unpack_properties(
         managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
     )
@@ -579,6 +618,8 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ZONE_NAV_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert MEMORY_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert ZONE_VOICE_CHARACTERISTIC_CCCD_PATH in managed_objects
+    assert INITIAL_POSE_CHARACTERISTIC_CCCD_PATH in managed_objects
     command_char = _unpack_properties(
         managed_objects["/org/xiaozhi/ble_app/service0/char0"][
             "org.bluez.GattCharacteristic1"
@@ -717,3 +758,93 @@ def test_refresh_advertisement_skipped_during_shutdown():
     server._shutdown_requested = True
 
     assert server._refresh_advertisement() is False
+
+
+def test_refresh_advertisement_ignores_release_during_unregister(monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(
+        "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
+        lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
+    )
+
+    server = BleControlServer(_ok_callback([]))
+    server._gatt_registered = True
+    server._advertisement_registered = True
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.unregistered = []
+            self.registered = []
+
+        def UnregisterAdvertisement(self, path, callback=None):
+            self.unregistered.append(path)
+            # BlueZ calls Release() while UnregisterAdvertisement is in flight.
+            server._on_advertisement_released()
+            callback(lambda: None)
+
+        def RegisterAdvertisement(self, path, options, callback=None):
+            self.registered.append(path)
+            callback(lambda: None)
+
+    server._advertising_manager = _Manager()
+
+    assert server._refresh_advertisement() is False
+
+    assert server._advertising_manager.unregistered == [ADVERTISEMENT_PATH]
+    assert server._advertising_manager.registered == [ADVERTISEMENT_PATH]
+    assert server._advertisement_registered is True
+    # Setting the flag False before Unregister must suppress the competing
+    # 2s re-register that _on_advertisement_released would otherwise queue.
+    assert scheduled == []
+
+
+def test_client_disconnected_schedules_single_refresh(monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(
+        "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
+        lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
+    )
+    server = BleControlServer(_ok_callback([]))
+    server._gatt_registered = True
+
+    server._on_client_disconnected()
+    server._on_client_disconnected()
+
+    assert scheduled == [(2, server._refresh_advertisement)]
+    assert server._advertisement_refresh_pending is True
+    assert server._advertisement_refresh_count == 1
+
+
+def test_client_disconnected_skipped_when_unregistered_or_shutting_down(
+    monkeypatch,
+):
+    scheduled = []
+    monkeypatch.setattr(
+        "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
+        lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
+    )
+    server = BleControlServer(_ok_callback([]))
+
+    server._on_client_disconnected()
+    assert scheduled == []
+
+    server._gatt_registered = True
+    server._shutdown_requested = True
+    server._on_client_disconnected()
+    assert scheduled == []
+    assert server._advertisement_refresh_count == 0
+
+
+def test_unexpected_advertisement_release_schedules_reregister(monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(
+        "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
+        lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
+    )
+    server = BleControlServer(_ok_callback([]))
+    server._advertisement_registered = True
+
+    server._on_advertisement_released()
+
+    assert scheduled == [(2, server._reregister_advertisement)]
+    assert server._advertisement_registered is False

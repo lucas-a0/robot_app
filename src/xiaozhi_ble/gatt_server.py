@@ -36,6 +36,9 @@ ZONE_NAV_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefc"
 CMD_VEL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefd"
 MEMORY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefe"
 ZONE_VOICE_CHAR_UUID = "12345678-1234-5678-1234-56789abcdeff"
+# The abcdefN tail is exhausted; new characteristics continue with the
+# abcd0NN series (see AGENTS.md section 3).
+INITIAL_POSE_CHAR_UUID = "12345678-1234-5678-1234-56789abcd010"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
@@ -56,6 +59,7 @@ ZONE_NAV_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char11"
 CMD_VEL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char12"
 MEMORY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char13"
 ZONE_VOICE_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char14"
+INITIAL_POSE_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char15"
 CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
 URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
 ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
@@ -73,6 +77,9 @@ ZONE_NAV_CHARACTERISTIC_CCCD_PATH = f"{ZONE_NAV_CHARACTERISTIC_PATH}/desc0"
 CMD_VEL_CHARACTERISTIC_CCCD_PATH = f"{CMD_VEL_CHARACTERISTIC_PATH}/desc0"
 MEMORY_CHARACTERISTIC_CCCD_PATH = f"{MEMORY_CHARACTERISTIC_PATH}/desc0"
 ZONE_VOICE_CHARACTERISTIC_CCCD_PATH = f"{ZONE_VOICE_CHARACTERISTIC_PATH}/desc0"
+INITIAL_POSE_CHARACTERISTIC_CCCD_PATH = (
+    f"{INITIAL_POSE_CHARACTERISTIC_PATH}/desc0"
+)
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
 # Receives (command, reason), returns the response text relayed to the App,
@@ -102,6 +109,11 @@ CmdVelCallback = Callable[[str], str]
 # Receives the raw Zone Voice write text, returns the immediate reply relayed
 # to the App (e.g. "PLAYING pool_zone.mp3", "LIST ...", or "ERR command").
 ZoneVoiceCallback = Callable[[str], str]
+# Receives the raw Initial Pose write text (any non-empty text means "reset
+# the pose now"), returns the immediate reply relayed to the App ("OK" or
+# "ERR ..."); publishing is fire-and-forget, so the immediate reply is the
+# final result.
+InitialPoseCallback = Callable[[str], str]
 
 
 class BridgeError(Exception):
@@ -1336,6 +1348,89 @@ class ZoneVoiceCharacteristic(InterfaceTemplate):
         logger.debug(f"Sent BLE zone-voice notification: {text!r}")
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class InitialPoseCharacteristic(InterfaceTemplate):
+    """Receive initial-pose triggers and notify the publish result."""
+
+    def __init__(self, callback: InitialPoseCallback) -> None:
+        super().__init__(self)
+        self._callback = callback
+        self._flags = ["read", "write", "notify"]
+        self._notifying = False
+        self._value: List[Byte] = []
+
+    @property
+    def UUID(self) -> Str:
+        return INITIAL_POSE_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return [INITIAL_POSE_CHARACTERISTIC_CCCD_PATH]
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        """Return the most recently published reply (empty when none)."""
+        return _read_bytes(self._value, options)
+
+    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
+        """Handle any non-empty UTF-8 write as "publish the fixed initial pose".
+
+        The payload itself is meaningless; the App only signals intent.
+        """
+        try:
+            text = bytes(value).decode("utf-8").strip()
+        except UnicodeDecodeError:
+            self._notify("ERR encoding")
+            return
+
+        if not text:
+            self._notify("ERR command")
+            return
+        logger.info(f"Received BLE initial-pose trigger: {text!r}")
+        try:
+            reply = self._callback(text)
+        except Exception:
+            logger.exception("Failed to dispatch BLE initial-pose command")
+            self._notify("ERR internal")
+            return
+        self._notify(reply)
+
+    def StartNotify(self) -> None:
+        self._notifying = True
+
+    def StopNotify(self) -> None:
+        self._notifying = False
+
+    def _notify(self, text: str) -> None:
+        data = list(_bounded_text(text).encode("utf-8"))
+        self._value = data
+        if not self._notifying:
+            return
+        try:
+            self.PropertiesChanged(
+                "org.bluez.GattCharacteristic1",
+                {"Value": Variant("ay", data)},
+                [],
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to emit BLE initial-pose notification: {text!r}"
+            )
+            return
+        logger.debug(f"Sent BLE initial-pose notification: {text!r}")
+
+
 @dbus_interface("org.bluez.GattDescriptor1")
 class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
     """Expose the standard descriptor clients write to enable notifications."""
@@ -1414,6 +1509,7 @@ class ControlService(InterfaceTemplate):
             CMD_VEL_CHARACTERISTIC_PATH,
             MEMORY_CHARACTERISTIC_PATH,
             ZONE_VOICE_CHARACTERISTIC_PATH,
+            INITIAL_POSE_CHARACTERISTIC_PATH,
         ]
 
 
@@ -1447,8 +1543,11 @@ class ControlAdvertisement(InterfaceTemplate):
         return True
 
     def Release(self) -> None:
-        """Handle BlueZ releasing the advertisement."""
-        logger.warning("BLE advertisement released by BlueZ")
+        """Handle BlueZ releasing the advertisement.
+
+        BlueZ also calls this when we UnregisterAdvertisement ourselves.
+        The server handler decides whether the release is unexpected.
+        """
         if self._on_release is not None:
             try:
                 self._on_release()
@@ -1490,6 +1589,7 @@ class GattApplication(InterfaceTemplate):
                             CMD_VEL_CHARACTERISTIC_PATH,
                             MEMORY_CHARACTERISTIC_PATH,
                             ZONE_VOICE_CHARACTERISTIC_PATH,
+                            INITIAL_POSE_CHARACTERISTIC_PATH,
                         ],
                     ),
                 }
@@ -1635,6 +1735,16 @@ class GattApplication(InterfaceTemplate):
                     ),
                 }
             },
+            INITIAL_POSE_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", INITIAL_POSE_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read", "write", "notify"]),
+                    "Descriptors": Variant(
+                        "ao", [INITIAL_POSE_CHARACTERISTIC_CCCD_PATH]
+                    ),
+                }
+            },
             CHARACTERISTIC_CCCD_PATH: {
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
@@ -1740,6 +1850,13 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
+            INITIAL_POSE_CHARACTERISTIC_CCCD_PATH: {
+                "org.bluez.GattDescriptor1": {
+                    "UUID": Variant("s", CCCD_UUID),
+                    "Characteristic": Variant("o", INITIAL_POSE_CHARACTERISTIC_PATH),
+                    "Flags": Variant("as", ["read", "write"]),
+                }
+            },
         }
 
 
@@ -1762,6 +1879,7 @@ class BleControlServer:
         zone_nav_callback: ZoneNavCallback | None = None,
         cmd_vel_callback: CmdVelCallback | None = None,
         zone_voice_callback: ZoneVoiceCallback | None = None,
+        initial_pose_callback: InitialPoseCallback | None = None,
     ) -> None:
         self._callback = callback
         self._url_callback = url_callback or (lambda _url: None)
@@ -1787,6 +1905,9 @@ class BleControlServer:
             return "ERR unavailable"
 
         self._zone_voice_callback = zone_voice_callback or _unavailable_zone_voice
+        self._initial_pose_callback = initial_pose_callback or (
+            lambda _text: "ERR unavailable"
+        )
         self._adapter_path = adapter_path
         self._device_name = device_name
         self._initial_state = initial_state
@@ -1799,6 +1920,7 @@ class BleControlServer:
         self._gatt_registered = False
         self._advertisement_registered = False
         self._advertisement_refresh_pending = False
+        self._advertisement_refresh_count = 0
         self._shutdown_requested = False
         self._error: str | None = None
         self._bus: SystemMessageBus | None = None
@@ -1821,6 +1943,7 @@ class BleControlServer:
         self._cmd_vel_characteristic: CmdVelCharacteristic | None = None
         self._memory_characteristic: MemoryStatusCharacteristic | None = None
         self._zone_voice_characteristic: ZoneVoiceCharacteristic | None = None
+        self._initial_pose_characteristic: InitialPoseCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1836,6 +1959,7 @@ class BleControlServer:
         self._gatt_registered = False
         self._advertisement_registered = False
         self._advertisement_refresh_pending = False
+        self._advertisement_refresh_count = 0
         self._shutdown_requested = False
         self._error = None
         self._thread = threading.Thread(
@@ -2072,6 +2196,9 @@ class BleControlServer:
             self._zone_voice_characteristic = ZoneVoiceCharacteristic(
                 self._zone_voice_callback
             )
+            self._initial_pose_characteristic = InitialPoseCharacteristic(
+                self._initial_pose_callback
+            )
             command_cccd = ClientCharacteristicConfigurationDescriptor(
                 CHARACTERISTIC_PATH,
                 self._characteristic.StartNotify,
@@ -2146,6 +2273,11 @@ class BleControlServer:
                 ZONE_VOICE_CHARACTERISTIC_PATH,
                 self._zone_voice_characteristic.StartNotify,
                 self._zone_voice_characteristic.StopNotify,
+            )
+            initial_pose_cccd = ClientCharacteristicConfigurationDescriptor(
+                INITIAL_POSE_CHARACTERISTIC_PATH,
+                self._initial_pose_characteristic.StartNotify,
+                self._initial_pose_characteristic.StopNotify,
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -2238,6 +2370,13 @@ class BleControlServer:
             )
             self._bus.publish_object(
                 ZONE_VOICE_CHARACTERISTIC_CCCD_PATH, zone_voice_cccd
+            )
+            self._bus.publish_object(
+                INITIAL_POSE_CHARACTERISTIC_PATH,
+                self._initial_pose_characteristic,
+            )
+            self._bus.publish_object(
+                INITIAL_POSE_CHARACTERISTIC_CCCD_PATH, initial_pose_cccd
             )
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)
@@ -2400,20 +2539,27 @@ class BleControlServer:
         logger.info("BLE advertisement re-registered")
 
     def _on_client_disconnected(self) -> None:
-        """Schedule an advertisement refresh after the BLE client goes away.
+        """Schedule an advertisement refresh after Command notify stops.
 
         BlueZ is supposed to resume the registered advertisement on its own
         once a connection drops, but several adapter/driver combinations
         never re-activate it after the first connection, leaving the robot
-        invisible to scans. Refresh the advertisement explicitly; it is
-        harmless when BlueZ did resume it (the App may also just have
-        unsubscribed without disconnecting).
+        invisible to scans. There is no Device1.Connected watch; this hook
+        runs from CommandCharacteristic.StopNotify, so it also fires when
+        the App merely unsubscribes and does not fire if Command notify was
+        never enabled. The Unregister/Register refresh is idempotent; it
+        briefly opens an advertising gap even when BlueZ already resumed.
         """
         if self._shutdown_requested or not self._gatt_registered:
             return
         if self._advertisement_refresh_pending:
             return
         self._advertisement_refresh_pending = True
+        self._advertisement_refresh_count += 1
+        logger.info(
+            "Command notify stopped; scheduling BLE advertisement refresh "
+            f"in 2s (count={self._advertisement_refresh_count})"
+        )
         # Small delay: BlueZ processes the disconnection first.
         GLib.timeout_add_seconds(2, self._refresh_advertisement)
 
@@ -2424,6 +2570,10 @@ class BleControlServer:
             return False
         if self._advertising_manager is None:
             return False
+        logger.info(
+            "Refreshing BLE advertisement after notify stop "
+            f"(count={self._advertisement_refresh_count})"
+        )
         if self._advertisement_registered:
             # Mark unregistered first: BlueZ may call Release() on the
             # advertisement object during unregistration, and the release

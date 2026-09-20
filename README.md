@@ -18,14 +18,17 @@
 
 - `gatt_server.py`：BlueZ GATT 外设（GLib 事件循环线程），实现 App 侧协议。
   客户端断开后会延迟几秒主动重新注册广播，兜底部分适配器断连后不再
-  恢复广播、导致重新扫描不到设备的问题。
+  恢复广播、导致重新扫描不到设备的问题。该自愈依赖 App 已订阅 Command
+  特征值的 Notify（BlueZ 在取消订阅或断连时调用 `StopNotify`）；未订阅
+  则不会触发。刷新是盲式注销再注册，BlueZ 自己已恢复时也只会造成短暂
+  广播空窗。
 - `control_client.py`：Unix socket 客户端，自动重连，请求/响应匹配。
 - `battery.py`：电池状态获取，在共享 rclpy 节点上订阅
   `sensor_msgs/BatteryState` 话题（默认 `/battery_state`），上报电量百分比和
   充电状态；ROS2 环境不可用时自动禁用，不影响其余功能。
 - `ros_runtime.py`：共享 rclpy 运行时，持有进程级唯一的 rclpy 上下文、
-  节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control、zone_nav 和
-  cmd_vel 都挂载在这个节点上，不各自创建上下文。
+  节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control、zone_nav、
+  cmd_vel 和 initial_pose 都挂载在这个节点上，不各自创建上下文。
 - `robot_control.py`：机器人行为控制，把 App 写入的命令名按配置映射为
   `std_srvs/Trigger` 服务并异步调用；成功静默，失败通过特征值 Notify 上报。
 - `network.py`：网络状态获取，直接从内核读取 WiFi 状态（SSID 用 wireless
@@ -54,6 +57,10 @@
 - `cmd_vel.py`：速度控制，把 App 写入的 `<linear_x> <angular_z>`（线速度
   m/s、角速度 rad/s）作为 `geometry_msgs/Twist` 发布到 `/cmd_vel`
   （共享 rclpy 节点）；每次写入发布一条消息，相同值不去重。
+- `initial_pose.py`：初始位姿设置（重新定位），App 写入任意非空内容即触发，
+  模块在共享 rclpy 节点上向 `/initialpose` 发布一条参数写死的
+  `geometry_msgs/PoseWithCovarianceStamped`（`map` 坐标系，位姿与协方差
+  硬编码在本模块内，App 不传坐标）；发布即发即弃，即时应答 `OK`。
 - `zone_voice.py`：区域语音播放，把 App 写入的 LIST/PLAY/STOP/STATUS 翻译为
   zone_voice_player 的 JSON Lines Unix socket 请求；按周期查询播放状态，
   仅变化时 Notify（含机器人自行触发的播放与自然结束）。播放器未运行时
@@ -292,6 +299,29 @@ zone_voice:
   socket_path: /tmp/zone_voice_player.sock
   request_timeout_secs: 2.0
   poll_interval_secs: 1.0
+```
+
+### 初始位姿设置
+
+App 向 Initial Pose 特征值写入任意非空内容（如 `1`），即可让机器人重新设置
+初始位姿。写入内容本身没有含义，只是“现在重新校准”的触发信号；位姿参数由
+机器人侧固定（`map` 坐标系，`x = 0.9512255787849426`、
+`y = -0.6430897116661072`，朝向四元数 `z = 0.017019178285167157`、
+`w = 0.9998551632964134`，协方差对角线 `x/y = 0.25`、
+`yaw = 0.06853891945200942`），硬编码在 `initial_pose.py`，不走 config.yaml。
+
+模块在共享 rclpy 节点上向 `initial_pose.topic` 配置的话题（默认
+`/initialpose`）发布一条 `geometry_msgs/PoseWithCovarianceStamped` 消息
+（`header.stamp` 为发布时刻，`frame_id` 为 `map`），后续重新定位行为由订阅
+该话题的模块（如 AMCL）完成。每次写入发布一条消息，相同内容不去重；空写入
+回复 `ERR command`，ROS 环境不可用时回复 `ERR unavailable`。`initial_pose.topic`
+留空则禁用该功能。`OK` 只表示消息已交给 ROS2 发布者，不表示重定位已完成。
+
+配置示例：
+
+```yaml
+initial_pose:
+  topic: /initialpose       # 初始位姿话题（geometry_msgs/PoseWithCovarianceStamped）
 ```
 
 ## 依赖安装

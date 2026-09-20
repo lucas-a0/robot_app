@@ -60,8 +60,10 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
   `ControlService.Characteristics`、`GattApplication.GetManagedObjects`，
   以及 `_run()` 里的创建/CCCD/发布。
   **尾号已用尽**：`abcdef0`–`abcdeff` 均已占用（Zone Voice 为 `abcdeff` /
-  `char14`）。再新增特征值必须换 UUID 方案（例如最后一组改为
-  `56789abcd010`），不要把 UUID 最后一组扩成 13 个十六进制字符。
+  `char14`）。再新增特征值必须换 UUID 方案：已启用
+  `12345678-1234-5678-1234-56789abcdNNN` 系列（首个为 Initial Pose 的
+  `...56789abcd010` / `char15`），后续按 `abcd011`、`abcd012` 递增，对象路径
+  继续从 `char16` 往下排；不要把 UUID 最后一组扩成 13 个十六进制字符。
 - BLE 对 App 保持纯文本；下游本机协议可以是 JSON Lines（如
   `zone_voice.py` 对接 `zone_voice_player`），翻译发生在桥接模块内部，
   不得把 JSON 包装泄漏到 GATT 特征值。

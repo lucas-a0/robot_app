@@ -27,6 +27,7 @@ from .config import BridgeConfig
 from .control_client import ControlClient, ControlRequestError, ControlUnavailable
 from .cpu import CpuProvider
 from .gatt_server import BleControlServer, BridgeError
+from .initial_pose import InitialPosePublisher
 from .latency import LatencyProvider
 from .memory import MemoryProvider
 from .nav_tasks import NavTaskManager
@@ -55,6 +56,11 @@ class _Bridge:
         # as geometry_msgs/Twist on the configured topic from the shared ROS
         # runtime node; every write publishes exactly one message (no dedup).
         self._cmd_vel = CmdVelPublisher(topic=config.cmd_vel_topic)
+        # Initial pose reset: any non-empty Initial Pose write publishes one
+        # hardcoded geometry_msgs/PoseWithCovarianceStamped on the configured
+        # topic from the shared ROS runtime node (the App only signals "reset
+        # now"; the pose itself lives in initial_pose.py).
+        self._initial_pose = InitialPosePublisher(topic=config.initial_pose_topic)
         # Zone voice: BLE LIST/PLAY/STOP/STATUS writes are translated into
         # JSON Lines requests against zone_voice_player; status changes
         # (natural end, ROS-triggered playback) come back through notify.
@@ -79,6 +85,7 @@ class _Bridge:
             zone_nav_callback=self._zone_nav.execute,
             cmd_vel_callback=self._cmd_vel.execute,
             zone_voice_callback=self._zone_voice.execute,
+            initial_pose_callback=self._initial_pose.execute,
         )
         self._client = ControlClient(
             socket_path=config.control_socket_path,
@@ -155,6 +162,7 @@ class _Bridge:
             or self._robot_control.enabled
             or self._zone_nav.enabled
             or self._cmd_vel.enabled
+            or self._initial_pose.enabled
         ):
             if self._ros_runtime.start():
                 node = self._ros_runtime.node
@@ -162,6 +170,7 @@ class _Bridge:
                 self._robot_control.start(node)
                 self._zone_nav.start(node)
                 self._cmd_vel.start(node)
+                self._initial_pose.start(node)
         self._network_provider.start()
         self._cpu_provider.start()
         self._memory_provider.start()
@@ -185,6 +194,7 @@ class _Bridge:
         self._network_provider.stop()
         self._zone_nav.stop()
         self._cmd_vel.stop()
+        self._initial_pose.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
@@ -209,6 +219,7 @@ class _Bridge:
         # rclpy context they run on.
         self._zone_nav.stop()
         self._cmd_vel.stop()
+        self._initial_pose.stop()
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
