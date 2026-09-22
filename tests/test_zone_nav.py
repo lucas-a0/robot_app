@@ -96,6 +96,7 @@ def test_navigator_rejects_unknown_zones(fake_std_msgs):
 def test_navigator_disabled_when_std_msgs_unavailable(monkeypatch):
     node = _FakeNode()
     monkeypatch.setitem(sys.modules, "std_msgs", None)
+    monkeypatch.setitem(sys.modules, "std_msgs.msg", None)
     navigator = ZoneNavigator("/xiaozhi_topic")
     navigator.start(node)
     assert node.publishers == []

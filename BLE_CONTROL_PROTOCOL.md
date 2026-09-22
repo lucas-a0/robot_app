@@ -1,15 +1,20 @@
-# 小智机器人 BLE 按住说话控制协议
+# 小智机器人 BLE 控制协议
 
 本文档定义手机 App 与小智机器人之间的 BLE（Bluetooth Low Energy）控制协议。
-协议用于实现与 Web 页面相同的“按住说话”行为：按钮按下开始收音，按钮松开结束收音。
+局域网 TCP 兜底通道见 [LAN_CONTROL_PROTOCOL.md](LAN_CONTROL_PROTOCOL.md)。
 
-协议版本：`1.12`
+协议版本：`2.1`（相对 2.0 为兼容扩展：Robot Control 增加前进 / 后退 / 转向 /
+跳舞 / 点头等命令名。2.0 相对 1.12 为破坏性变更：删除按住说话 / WebSocket URL /
+Error / 对话服务器延迟四个特征值；新增只读的 LAN Endpoint 与 Audio Endpoint）。
 
 ## 1. 适用范围
 
 - 本协议定义手机 App 与机器人之间的 BLE 控制通道，由机器人侧实现。
   App 只与本协议交互，不感知机器人内部实现。
-- BLE 只传输控制命令和机器人状态，不通过 BLE 传输音频。
+- BLE 只传输控制命令和机器人状态，不通过 BLE 传输音频。语音对话由 App 完成；
+  App 通过 LAN Endpoint / Audio Endpoint 得知本机地址后，把 PCM 打到音频口。
+- Android 15 起一条 BLE 连接大约只能订阅 15 路 Notify。本服务当前占用 12 路
+  Notify；LAN Endpoint 与 Audio Endpoint **不加 Notify**。
 
 ## 2. GATT 定义
 
@@ -20,18 +25,14 @@
 
 Service 内的特征值按功能分类，UUID 均为 `12345678-1234-5678-1234-56789abcdefN`
 （`abcdefN` 尾号已用尽，其后的新特征值改用 `12345678-1234-5678-1234-56789abcdNNN`，
-当前为 `abcd010`）：
+当前已用到 `abcd012`）：
 
 | 类别 | 特征值 | UUID 尾号 | 属性 |
 |---|---|---|---|
-| 语音控制 | Command Characteristic | `abcdef1` | Read、Write、Notify |
-| 连接配置 | WebSocket URL Characteristic | `abcdef2` | Read、Write、Notify |
-| 连接配置 | Error Characteristic | `abcdef3` | Read、Notify |
 | 状态监测 | Battery Status Characteristic | `abcdef4` | Read、Notify |
 | 状态监测 | Network Status Characteristic | `abcdef5` | Read、Notify |
 | 状态监测 | CPU Status Characteristic | `abcdef6` | Read、Notify |
 | 状态监测 | Bandwidth Status Characteristic | `abcdef7` | Read、Notify |
-| 状态监测 | Latency Status Characteristic | `abcdef8` | Read、Notify |
 | 行为控制 | Robot Control Characteristic | `abcdef9` | Read、Write、Notify |
 | 连接配置 | WiFi Config Characteristic | `abcdefa` | Read、Write、Notify |
 | 任务控制 | Nav Task Characteristic | `abcdefb` | Read、Write、Notify |
@@ -40,6 +41,11 @@ Service 内的特征值按功能分类，UUID 均为 `12345678-1234-5678-1234-56
 | 状态监测 | Memory Status Characteristic | `abcdefe` | Read、Notify |
 | 音频控制 | Zone Voice Characteristic | `abcdeff` | Read、Write、Notify |
 | 定位配置 | Initial Pose Characteristic | `abcd010` | Read、Write、Notify |
+| 连接发现 | LAN Endpoint Characteristic | `abcd011` | Read |
+| 连接发现 | Audio Endpoint Characteristic | `abcd012` | Read |
+
+已删除、不再出现在 Service 中的 UUID：`abcdef1`（Command）、`abcdef2`（URL）、
+`abcdef3`（Error）、`abcdef8`（Latency）。保留特征值的 UUID 不变。
 
 广播名称可在机器人侧配置修改。App 应以 Service UUID 识别设备，不应只依赖广播名称。
 
@@ -48,174 +54,44 @@ Service 内的特征值按功能分类，UUID 均为 `12345678-1234-5678-1234-56
 - App 写入和机器人通知均为 UTF-8 文本。
 - 每条消息只包含一条完整指令或响应，不添加 JSON 包装。
 - App 写入时可以带首尾空白；机器人解析时会去除首尾空白并忽略命令大小写。
-- Command 特征值中的命令、响应和状态均不超过默认 ATT MTU 下单包可承载的 20 字节；
-  其余特征值按 180 字节上限处理，超长文本由机器人侧截断。
+- 特征值按 180 字节上限处理，超长文本由机器人侧截断。
 - App 应优先使用 GATT Write With Response，确认写入已被 BLE 协议栈接收；
-  需要高频连续写入的 Cmd Vel 特征值除外（见第 12 节）。
+  需要高频连续写入的 Cmd Vel 特征值除外（见第 11 节）。
 - 状态监测类特征值在数据尚未获取到时统一报 `UNKNOWN`；字段级缺失用占位符（如 `-`）。
-- 各特征值的具体文本格式见对应章节：Command 见第 4 节，WebSocket URL 见第 5 节，
-  Error 见第 6 节，状态监测各特征值见第 7 节，Robot Control 见第 8 节，
-  WiFi Config 见第 9 节，Nav Task 见第 10 节，Zone Nav 见第 11 节，
-  Cmd Vel 见第 12 节，Zone Voice 见第 13 节，Initial Pose 见第 14 节。
+- 各特征值的具体文本格式见对应章节：LAN Endpoint 见第 4 节，Audio Endpoint 见第 5 节，
+  状态监测各特征值见第 6 节，Robot Control 见第 7 节，WiFi Config 见第 8 节，
+  Nav Task 见第 9 节，Zone Nav 见第 10 节，Cmd Vel 见第 11 节，
+  Zone Voice 见第 12 节，Initial Pose 见第 13 节。
 
-## 4. 语音控制（按住说话）
+## 4. 局域网控制口（LAN Endpoint）
 
-### 4.1 控制命令（App → 机器人）
+App 读取 LAN Endpoint 特征值，获得机器人当前的局域网控制地址，用于建立
+[LAN_CONTROL_PROTOCOL.md](LAN_CONTROL_PROTOCOL.md) 中的 TCP 控制连接（蓝牙断开后的兜底）。
 
-App 向 Command 特征值写入控制命令：
+- 只读，无 Notify。端口几乎不变；IP 变化已经由 Network Status 推送。
+- 值为 UTF-8 文本 `<ipv4> <port>`，例如 `192.168.1.12 4205`。
+- 尚无 IPv4（未连上 WiFi）时整个值为 `UNKNOWN`。
+- App 在 BLE 连上后 Read 一次即可；TCP 连不上或 WiFi 重连后应再 Read。
 
-| 写入内容 | 触发时机 | 机器人行为 |
-|---|---|---|
-| `start` | 按住说话按钮时 | 开始收音；若 AI 正在播放，则打断播放并开始收音 |
-| `stop` | 松开或取消按钮操作时 | 结束收音，并把本次语音交给服务端处理 |
+## 5. 音频下发口（Audio Endpoint）
 
-`start` 和 `stop` 是幂等指令：重复发送不会开启多个录音会话，也不会导致协议错误。
+App 读取 Audio Endpoint 特征值，获得把播放用 PCM 打到哪台机器的哪个端口。
+语音对话由 App 完成，机器人只负责按该地址接收裸 PCM 并播放。
 
-### 4.2 状态与应答（机器人 → App）
+- 只读，无 Notify。
+- 值为 UTF-8 文本 `<ipv4> <port>`，例如 `192.168.1.12 4203`。
+- 尚无 IPv4，或本机 PCM 播放服务查询失败时整个值为 `UNKNOWN`。不要把 PCM
+  打向 `UNKNOWN`。
+- PCM 格式为 16-bit 小端、单声道、24000 Hz，走独立 TCP 连接，不经过本特征值、
+  也不经过 LAN 控制口。
 
-App 必须订阅 Command Characteristic 的 Notify。订阅成功后，机器人立即发送当前状态。
-
-#### 4.2.1 命令接收结果
-
-| 通知内容 | 含义 |
-|---|---|
-| `OK start` | `start` 已接受并调度 |
-| `OK stop` | `stop` 已接受并调度 |
-| `ERR encoding` | 写入内容不是合法 UTF-8 |
-| `ERR command` | 不支持该命令 |
-| `ERR internal` | 机器人内部未能调度命令 |
-
-`OK` 表示命令已被机器人控制层接受，不表示状态切换已经完成。App 应通过后续的
-`STATE ...` 通知确认实际状态。
-
-#### 4.2.2 机器人状态
-
-| 通知内容 | 含义 |
-|---|---|
-| `STATE idle` | 空闲，当前没有收音或播放 |
-| `STATE connecting` | 正在连接语音服务端 |
-| `STATE listening` | 正在收音 |
-| `STATE speaking` | AI 正在播放语音 |
-
-App 不应根据 `OK start` 直接假定机器人已进入 `listening`，也不应根据 `OK stop`
-直接假定机器人已进入 `idle` 或 `speaking`。
-
-### 4.3 标准交互时序
-
-```text
-App                                      Robot
- |                                         |
- |---- Scan by Service UUID -------------->|
- |---- Connect ---------------------------->|
- |---- Subscribe Command Notify ---------->|
- |<-------------------------- STATE idle --|
- |                                         |
- |  用户按下按钮                            |
- |---- Write "start" --------------------->|
- |<----------------------------- OK start --|
- |<---------------------- STATE listening --|
- |                                         |
- |  用户松开按钮                            |
- |---- Write "stop" ---------------------->|
- |<------------------------------ OK stop --|
- |<--------------------------- STATE idle --|
- |<----------------------- STATE speaking --|  取决于服务端响应
-```
-
-状态可能因网络和语音服务端行为出现不同的合法序列，App 应按收到的最后一个
-`STATE` 更新界面，不应写死 `stop` 后必然立刻进入某个状态。
-
-### 4.4 断连与异常处理
-
-#### 4.4.1 机器人行为
-
-- 机器人只在 App 已订阅 Notify 后接受 `start`。
-- 接受 `start` 后，机器人记录一次“按钮仍按下”的 BLE 控制状态。
-- 收到 `stop` 后清除该状态。
-- 如果按钮仍处于按下状态时发生以下任一情况，机器人自动执行一次 `stop`：
-  - BLE 连接断开；
-  - App 取消 Notify 订阅；
-  - 机器人侧 BLE 服务关闭或进程退出。
-- 自动 `stop` 是安全兜底，用于处理 App 崩溃、手机离开通信范围或松开消息丢失。
-
-#### 4.4.2 App 行为
-
-App 应在以下所有场景主动写入 `stop`，不能只处理普通的手指抬起事件：
-
-- 按钮 `touch up`；
-- 触摸被系统取消；
-- 手指移出按钮且产品交互定义为取消；
-- App 进入后台；
-- 页面退出或控制组件销毁；
-- App 主动断开 BLE 连接之前。
-
-连接意外断开后，App 应立即把本地按钮恢复为未按下状态。重连流程必须重新发现服务、
-重新订阅 Notify，并以机器人最新的 `STATE` 为准；App 不得在重连后自动补发旧的 `start`。
-
-## 5. WebSocket URL 配置
-
-App 应发现并订阅 WebSocket URL 特征值。订阅成功后，机器人立即通知当前生效地址；读取该
-特征值也会返回当前生效地址。
-
-URL 特征值使用 UTF-8 文本，最大 180 字节；只接受 `ws://` 或 `wss://`，且必须包含
-主机名。App 应在写 URL 前协商至少 183 字节的 ATT MTU（有效载荷为 MTU 减 3，通常
-请求 MTU 247）。
-
-App 直接向该特征值写入完整 URL，例如：
-
-```text
-wss://robot.example.com:10000/ws/robot
-```
-
-写入响应只表示机器人已经接收并开始处理，不表示新地址已经连接成功。机器人会：
-
-1. 校验并持久化保存 URL。
-2. 关闭当前 WebSocket，更新地址并立即尝试重新连接。
-3. 持久化成功后通过 URL 特征值 Notify 新地址；连接失败则通过 Error 特征值报告错误。
-
-新地址暂时不可用时，机器人保留该地址并继续后台重连；App 仍可通过 BLE 写入新的地址，
-无需等待重连成功。
-
-如果当前状态为 `listening` 或 `speaking`，配置会被拒绝并报告
-`CONFIG_BUSY`。App 应等待 `STATE idle` 或 `STATE connecting` 后再修改地址；
-`connecting` 状态下写入会被接受，机器人会中断当前重连尝试并改用新地址。
-
-机器人侧可能通过自身配置锁定 URL（锁定地址优先于 BLE 写入）。此时写入会报告
-`CONFIG_LOCKED`，读取仍返回锁定的生效地址。
-
-## 6. Error 特征值（错误上报）
-
-App 应订阅 Error 特征值。订阅后会立即收到最近一次错误，当前没有错误时为 `NONE`。错误
-通知格式为：
-
-```text
-ERROR <code> <message>
-```
-
-当前错误码包括：
-
-| 错误码 | 含义 |
-|---|---|
-| `WS_ERROR` | WebSocket 建连、接收、Ping 或连接超时失败 |
-| `VOICE_UNAVAILABLE` | 机器人语音功能不可用（语音服务未就绪） |
-| `CONFIG_ENCODING` | URL 不是合法 UTF-8 |
-| `CONFIG_INVALID` | URL 为空或不是合法 `ws`/`wss` 地址 |
-| `CONFIG_BUSY` | 机器人正在收音或播放（`listening`/`speaking`） |
-| `CONFIG_LOCKED` | URL 被机器人侧配置锁定 |
-| `CONFIG_SAVE` | 覆盖文件无法写入 |
-| `CONFIG_APPLY` | URL 已保存但运行时应用失败 |
-| `CONFIG_INTERNAL` | BLE 配置请求无法调度 |
-
-WebSocket 恢复连接后会通知 `NONE`，App 可据此清除错误提示。Error 特征值的通知最大为
-180 字节，过长的底层异常文本会被截断。
-
-## 7. 状态监测
+## 6. 状态监测
 
 状态监测类特征值均为只读（Read、Notify），App 不应写入；订阅成功后立即收到当前
-缓存值，之后按各自的通知策略推送。电池、CPU 和内存属于机身状态，WiFi 连接、带宽和
-服务器延迟属于网络状态。
+缓存值，之后按各自的通知策略推送。电池、CPU 和内存属于机身状态，WiFi 连接和带宽
+属于网络状态。
 
-### 7.1 电池状态（Battery Status）
+### 6.1 电池状态（Battery Status）
 
 App 可以读取或订阅 Battery Status 特征值来获取机器人的电池状态。
 
@@ -229,7 +105,7 @@ App 可以读取或订阅 Battery Status 特征值来获取机器人的电池状
 
 示例：`0.670 CHARGING`、`0.982 FULL`、`UNKNOWN DISCHARGING`、`UNKNOWN`。
 
-### 7.2 CPU 使用率（CPU Status）
+### 6.2 CPU 使用率（CPU Status）
 
 App 可以读取或订阅 CPU Status 特征值来获取机器人的整机 CPU 使用率。
 
@@ -238,12 +114,12 @@ App 可以读取或订阅 CPU Status 特征值来获取机器人的整机 CPU �
 - 值为 UTF-8 文本，格式为 `CPU <usage>`，`usage` 为 0-100 的百分比、保留一位
   小数，例如 `CPU 23.5`；尚未获取到读数时为 `UNKNOWN`。
 
-### 7.3 网络状态
+### 6.3 网络状态
 
-网络状态由三个特征值组成：WiFi 连接状态（连没连、信号、IP、SSID）、WiFi 带宽速率
-（实时上行/下行吞吐）和对话服务器延迟（到语音服务端的通信延迟）。
+网络状态由两个特征值组成：WiFi 连接状态（连没连、信号、IP、SSID）和 WiFi 带宽速率
+（实时上行/下行吞吐）。
 
-#### 7.3.1 WiFi 连接状态（Network Status）
+#### 6.3.1 WiFi 连接状态（Network Status）
 
 App 可以读取或订阅 Network Status 特征值来获取机器人的 WiFi 连接状态。
 
@@ -261,7 +137,7 @@ App 可以读取或订阅 Network Status 特征值来获取机器人的 WiFi 连
 
 示例：`WIFI -38 172.16.0.195 MyHome`、`WIFI -52 - Office AP 2F`。
 
-#### 7.3.2 WiFi 带宽速率（Bandwidth Status）
+#### 6.3.2 WiFi 带宽速率（Bandwidth Status）
 
 App 可以读取或订阅 Bandwidth Status 特征值来获取机器人 WiFi 网卡的实时吞吐速率。
 
@@ -274,24 +150,7 @@ App 可以读取或订阅 Bandwidth Status 特征值来获取机器人 WiFi 网�
 
 示例：`BANDWIDTH 1234.5 56.7`、`UNKNOWN`。
 
-#### 7.3.3 对话服务器延迟（Latency Status）
-
-App 可以读取或订阅 Latency Status 特征值来获取机器人到对话服务器（WebSocket 地址
-对应的主机）的通信延迟。机器人侧按周期向该主机发起 TCP 建连，以建连耗时近似
-`ping` 延迟。
-
-- 仅在延迟变化达到阈值（默认 10 毫秒）或可达性变化时通知。
-- 值为 UTF-8 文本，可能取值：
-
-| 值 | 含义 |
-|---|---|
-| `UNKNOWN` | 尚未获取到读数（尚未从对话模块同步到服务器地址，或机器人刚启动） |
-| `LATENCY <ms>` | 服务器可达；`ms` 为建连延迟，整数毫秒 |
-| `LATENCY -` | 服务器不可达（连接被拒绝或超时） |
-
-示例：`LATENCY 37`、`LATENCY -`、`UNKNOWN`。
-
-### 7.4 内存占用（Memory Status）
+### 6.4 内存占用（Memory Status）
 
 App 可以读取或订阅 Memory Status 特征值来获取机器人的整机内存占用。
 
@@ -306,13 +165,25 @@ App 可以读取或订阅 Memory Status 特征值来获取机器人的整机内�
 
 示例：`MEM 2145 7872 27.2`、`UNKNOWN`。
 
-## 8. 机器人行为控制（Robot Control）
+## 7. 机器人行为控制（Robot Control）
 
-App 可以向 Robot Control 特征值写入命令名，控制机器人执行预配置的行为（如站立、
-蹲下）。机器人侧维护一张“命令名 → 行为”的映射表，写入的命令名查表后异步执行。
+App 可以向 Robot Control 特征值写入命令名，控制机器人执行预配置的行为（站立、
+蹲下、前进、后退、转向、跳舞、点头）。写入的命令名查表后异步执行。
 
-- App 写入内容为命令名（UTF-8 文本），例如 `stand_up`、`lie_down`；机器人解析时
-  去除首尾空白并忽略大小写。
+- App 写入内容为命令名（UTF-8 文本）；机器人解析时去除首尾空白并忽略大小写。
+- 固定命令名：
+
+| 命令名 | 含义 |
+|---|---|
+| `go_forward` | 前进一小段后自动停下 |
+| `go_back` | 后退一小段后自动停下 |
+| `turn_left` | 左转一小段后自动停下 |
+| `turn_right` | 右转一小段后自动停下 |
+| `dance` | 跳舞（左右小幅转向） |
+| `nod` | 点头（短距前后点两次） |
+| `stand_up` | 站起 |
+| `squat` / `lie_down` | 蹲下（两者等价） |
+
 - 命令执行**成功时完全静默**，不发送任何通知。
 - 仅在失败时通过 Notify 上报错误，格式为 `ERR ...`；读取该特征值返回最近一次
   上报的错误（尚无错误时为空）：
@@ -331,13 +202,13 @@ App 可以向 Robot Control 特征值写入命令名，控制机器人执行预�
 命令，否则可能收不到错误通知。`ERR failed`/`ERR timeout` 中的 `<command>` 为机器人
 实际执行的命令名（已规范化），便于 App 区分并发命令的结果。
 
-## 9. WiFi 配网（WiFi Config）
+## 8. WiFi 配网（WiFi Config）
 
 App 可以向 WiFi Config 特征值写入目标 WiFi 的 SSID 和密码，机器人连接指定
 WiFi，并把连接结果通过 Notify 异步上报。机器人侧保存该 WiFi 配置，重启网络后
 自动重连。
 
-### 9.1 写入格式（App → 机器人）
+### 8.1 写入格式（App → 机器人）
 
 写入内容为 UTF-8 文本两行，以单个换行符 `\n` 分隔：
 
@@ -350,9 +221,9 @@ WiFi，并把连接结果通过 Notify 异步上报。机器人侧保存该 WiFi
 - 第二行为密码；空行或省略第二行均表示连接开放（无密码）网络。WPA/WPA2 密码为
   8-63 个字符。
 - 尾部换行可选；机器人解析时会去除各行首尾空白。
-- 写入总长不超过 180 字节；App 应在写入前协商至少 183 字节的 ATT MTU（同 URL 特征值）。
+- 写入总长不超过 180 字节；App 应在写入前协商至少 183 字节的 ATT MTU。
 
-### 9.2 应答与结果（机器人 → App）
+### 8.2 应答与结果（机器人 → App）
 
 App 必须先订阅 WiFi Config 特征值的 Notify 再写入，否则可能收不到结果通知。连接
 通常需要数秒到数十秒，应答与结果分两条通知：
@@ -381,7 +252,7 @@ App 必须先订阅 WiFi Config 特征值的 Notify 再写入，否则可能收�
 连接过程中机器人的 Network Status 特征值会先变为 `DISCONNECTED`、成功后再变为
 `WIFI ...`（新 SSID）；App 判断本次配网成败应以 WiFi Config 的结果通知为准。
 
-### 9.3 标准交互时序
+### 8.3 标准交互时序
 
 ```text
 App                                      Robot
@@ -393,19 +264,19 @@ App                                      Robot
  |<--- Network Status: WIFI -42 ... MyHome|  由状态监测特征值另行上报
 ```
 
-## 10. 导航任务控制（Nav Task）
+## 9. 导航任务控制（Nav Task）
 
 App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两个固定的导航
 任务：`localization`（定位）和 `navigation`（导航）。两个任务的默认参数
-由机器人侧固定（见 10.2），App 只能在白名单内覆盖参数。
+由机器人侧固定（见 9.2），App 只能在白名单内覆盖参数。
 
 - 机器人侧服务正常停止（含服务重启）时会先停止仍在运行的任务。
 - 任务输出不通过 BLE 转发。
 - 写入/通知均为 UTF-8 文本，通知不超过 180 字节；带参数覆盖的写入可能较长，写入前
-  建议协商至少 183 字节的 ATT MTU（同 URL 特征值）。机器人解析时去除首尾空白，
+  建议协商至少 183 字节的 ATT MTU。机器人解析时去除首尾空白，
   命令动词与任务名忽略大小写；参数 key 小写规范化，value 原样保留。
 
-### 10.1 写入命令（App → 机器人）
+### 9.1 写入命令（App → 机器人）
 
 | 写入内容 | 含义 |
 |---|---|
@@ -415,13 +286,13 @@ App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两
 | `STATUS` | 查询两个任务的当前状态 |
 
 - `<task>` 为 `localization` 或 `navigation`。
-- `key=value` 之间以空白分隔；key 必须在 10.2 的白名单内；value 不能为空、不能含
+- `key=value` 之间以空白分隔；key 必须在 9.2 的白名单内；value 不能为空、不能含
   空白字符。
 - `START navigation` 要求 `localization` 处于 `RUNNING`，否则拒绝（见
   `ERR state localization not_running`）；机器人不会自动代起 localization，
   启动顺序由 App 控制。
 
-### 10.2 可覆盖参数与默认值
+### 9.2 可覆盖参数与默认值
 
 `localization`：
 
@@ -448,7 +319,7 @@ App 可以向 Nav Task 特征值写入命令，在机器人上启动或停止两
 默认值可能随机器人部署调整，App 不应把默认值写死在本地；需要默认值时省略该 key
 即可。
 
-### 10.3 应答与状态通知（机器人 → App）
+### 9.3 应答与状态通知（机器人 → App）
 
 App 必须先订阅 Nav Task 特征值的 Notify 再写入；订阅成功后机器人立即推送当前
 `STATE ...`。`STARTED`/`STOPPING`/`ERR` 为写入的即时应答，`STOPPED`/`EXITED`
@@ -483,7 +354,7 @@ App 必须先订阅 Nav Task 特征值的 Notify 再写入；订阅成功后机�
 `STARTED` 只表示任务已启动；任务内部就绪需要数秒到数十秒，App 不应依据
 `STARTED` 立即假定可以下发导航目标。
 
-### 10.4 标准交互时序
+### 9.4 标准交互时序
 
 ```text
 App                                      Robot
@@ -503,7 +374,7 @@ App                                      Robot
 异常示例：任务异常退出时机器人主动推送，如
 `EXITED navigation 1 [amcl]: map could not be loaded`。
 
-## 11. 区域导航（Zone Nav）
+## 10. 区域导航（Zone Nav）
 
 App 可以向 Zone Nav 特征值写入区域名，让机器人导航到四个固定区域之一：
 `charging_zone`（充电区）、`mowing_zone`（割草区）、`pool_zone`（泳池区）、
@@ -527,7 +398,7 @@ App 可以向 Zone Nav 特征值写入区域名，让机器人导航到四个固
 ROS2 发布者，不表示机器人已开始移动或已到达目标区域；导航进度与到达情况
 不通过 BLE 上报。
 
-## 12. 速度控制（Cmd Vel）
+## 11. 速度控制（Cmd Vel）
 
 App 可以向 Cmd Vel 特征值写入线速度和角速度，直接控制机器人运动。机器人侧
 每收到一次写入，就向 ROS2 话题 `/cmd_vel` 发布一条 `geometry_msgs/Twist`
@@ -559,7 +430,7 @@ App 可以向 Cmd Vel 特征值写入线速度和角速度，直接控制机器�
 ROS2 发布者，不表示机器人已开始运动。连续写入时建议使用 Write Without Response
 并控制写入节奏（见上文 20-30 Hz 的建议），避免超出连接间隔承载能力。
 
-## 13. 区域语音播放（Zone Voice）
+## 12. 区域语音播放（Zone Voice）
 
 App 可以向 Zone Voice 特征值写入命令，列出、播放或停止机器人上的区域提示音，
 并查询当前播放状态。可播文件由机器人侧维护，App 应通过 `LIST` 获取当前列表，
@@ -575,7 +446,7 @@ App 可以向 Zone Voice 特征值写入命令，列出、播放或停止机器�
 - 音频自然播完后状态自动回到 `IDLE`；机器人自行开始播放时也会通知 `PLAYING`。
   App 订阅后即可通过 Notify 跟踪状态，不必轮询 `STATUS`。
 
-### 13.1 写入命令（App → 机器人）
+### 12.1 写入命令（App → 机器人）
 
 | 写入内容 | 含义 |
 |---|---|
@@ -584,7 +455,7 @@ App 可以向 Zone Voice 特征值写入命令，列出、播放或停止机器�
 | `STOP` | 停止当前播放 |
 | `STATUS` | 查询当前播放状态 |
 
-### 13.2 应答与状态通知（机器人 → App）
+### 12.2 应答与状态通知（机器人 → App）
 
 App 必须先订阅 Zone Voice 特征值的 Notify 再写入；订阅成功后机器人立即推送
 当前状态（`PLAYING ...` / `IDLE` / `UNKNOWN`）。`LIST`/`PLAY`/`STOP`/`STATUS`
@@ -611,7 +482,7 @@ App 必须先订阅 Zone Voice 特征值的 Notify 再写入；订阅成功后�
 读取该特征值返回最近一次通知文本（尚无通知时为当前状态）。`PLAYING` 只表示
 已开始播放，不通过 BLE 传输音频数据。
 
-### 13.3 标准交互时序
+### 12.3 标准交互时序
 
 ```text
 App                                      Robot
@@ -625,7 +496,7 @@ App                                      Robot
  |<------------------------------ IDLE --|  自然结束，机器人主动推送
 ```
 
-## 14. 初始位姿设置（Initial Pose）
+## 13. 初始位姿设置（Initial Pose）
 
 App 可以在机器人定位丢失或需要重新校准时，向 Initial Pose 特征值写入任意
 非空内容，让机器人重新设置自己的初始位姿（重新定位）。**写入内容本身没有
@@ -656,82 +527,74 @@ BLE 获取；具体数值见项目 README。
 ROS2 发布者，不表示机器人已完成重新定位或定位已收敛；重定位结果与收敛情况
 不通过 BLE 上报。
 
-## 15. 连接约束
+## 14. 连接约束
 
-- 当前版本按单个控制 App 设计，不支持多个 App 同时争用按住说话控制权。
+- 当前版本按单个控制 App 设计。LAN TCP 新连接会踢掉旧连接。
 - 当前版本不定义应用层鉴权、加密载荷或强制 BLE 配对；连接安全由内部测试环境负责。
-- WebSocket URL 特征值允许普通 BLE 连接直接读写，便于内部测试快速切换服务端地址。
-- App 应设置合理的连接和写入超时。一次写入失败时，应将按钮恢复为未按下状态；若连接仍然
-  有效，可以补发一次 `stop`，但不应自动重试 `start`。
+- App 应设置合理的连接和写入超时。
+- 蓝牙断开后应改用已建立的 LAN TCP 控制连接；TCP 也断了则等 BLE 恢复后重新
+  Read LAN Endpoint 再连。
 
-## 16. App 实现检查表
+## 15. App 实现检查表
 
-语音控制：
+连接发现：
 
 1. 扫描并按 Service UUID 筛选机器人。
-2. 连接后发现 Service 和 Command Characteristic。
-3. 先订阅 Notify，收到首条 `STATE ...` 后再启用按住说话按钮。
-4. 按下时写入 `start`，松开或取消时写入 `stop`。
-5. 用 `STATE ...` 驱动页面状态，用 `OK ...` / `ERR ...` 处理单次命令结果。
-6. 断连时复位按钮；重连后不恢复上一次按下状态。
-
-连接配置：
-
-7. 订阅 URL 特征值和 Error 特征值；收到 URL Notify 后更新当前服务器显示。
-8. 修改 URL 前避免在 `listening`/`speaking` 状态下写入（会被 `CONFIG_BUSY` 拒绝）；
-   `idle` 和 `connecting` 状态下可直接写入，写入后等待 URL Notify 和 Error 特征值结果。
-9. URL 写入前协商足够的 MTU。
+2. 连接后 Read LAN Endpoint，得到 `<ipv4> 4205`（或配置的控制口）；值为
+   `UNKNOWN` 时不要连 TCP。
+3. Read Audio Endpoint，得到 PCM 下发地址；`UNKNOWN` 时不要发送音频。
+4. 需要兜底时按 LAN Endpoint 建立 TCP，协议见 LAN_CONTROL_PROTOCOL.md。
+5. 订阅 Notify 时注意 Android 15 大约 15 路上限；不要给 LAN/Audio 开 Notify
+   （这两个特征值也没有 Notify）。
 
 状态监测：
 
-10. 读取或订阅 Battery Status 特征值；值为 `UNKNOWN` 或字段为 `UNKNOWN` 时按未知显示。
-11. 读取或订阅 CPU Status 特征值；值为 `UNKNOWN` 时显示为使用率未知。
-12. 读取或订阅 Network Status 特征值；`UNKNOWN` 显示为网络状态未知，`DISCONNECTED`
-    显示为未连接。
-13. 读取或订阅 Bandwidth Status 特征值；值为 `UNKNOWN` 时显示为速率未知。
-14. 读取或订阅 Latency Status 特征值；`UNKNOWN` 显示为延迟未知，`LATENCY -`
-    显示为服务器不可达。
-15. 读取或订阅 Memory Status 特征值；值为 `UNKNOWN` 时显示为内存占用未知。
+6. 读取或订阅 Battery Status 特征值；值为 `UNKNOWN` 或字段为 `UNKNOWN` 时按未知显示。
+7. 读取或订阅 CPU Status 特征值；值为 `UNKNOWN` 时显示为使用率未知。
+8. 读取或订阅 Network Status 特征值；`UNKNOWN` 显示为网络状态未知，`DISCONNECTED`
+   显示为未连接。IP 变化以该特征值的 Notify 为准，然后可再 Read LAN/Audio。
+9. 读取或订阅 Bandwidth Status 特征值；值为 `UNKNOWN` 时显示为速率未知。
+10. 读取或订阅 Memory Status 特征值；值为 `UNKNOWN` 时显示为内存占用未知。
 
 行为控制：
 
-16. 使用机器人行为控制时，先订阅 Robot Control 特征值的 Notify 再写入命令；
+11. 使用机器人行为控制时，先订阅 Robot Control 特征值的 Notify 再写入命令；
     成功无通知，收到 `ERR ...` 时按错误码提示用户。
 
 WiFi 配网：
 
-17. 配网前先订阅 WiFi Config 特征值的 Notify，写入前协商足够的 MTU。
-18. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
+12. 配网前先订阅 WiFi Config 特征值的 Notify，写入前协商足够的 MTU。
+13. 写入格式为 `<ssid>\n<password>` 两行；收到 `CONNECTING` 后等待最终结果，
     以 `CONNECTED`/`FAILED` 为准更新界面，不要依据 `CONNECTING` 假定连接成功。
-19. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。
+14. 收到 `ERR busy` 时提示用户等待上一次配网结束；配网期间不要重复写入。
 
 导航任务：
 
-20. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
+15. 使用导航任务前，先订阅 Nav Task 特征值的 Notify，以收到的 `STATE ...` 为准
     更新界面；`START navigation` 前先确认 localization 为 `RUNNING`。
-21. `STARTED` 不代表导航就绪；任务异常退出以 `EXITED` 通知为准提示用户。
+16. `STARTED` 不代表导航就绪；任务异常退出以 `EXITED` 通知为准提示用户。
 
 区域导航：
 
-22. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
+17. 向 Zone Nav 特征值写入四个区域名之一（`charging_zone`、`mowing_zone`、
     `pool_zone`、`equipment_zone`）；以 `OK <zone>` 确认消息已发布，
     收到 `ERR ...` 时按错误码提示用户。
 
 速度控制：
 
-23. 向 Cmd Vel 特征值写入 `<linear_x> <angular_z>`（如 `-0.30 0.0`）；相同值
+18. 向 Cmd Vel 特征值写入 `<linear_x> <angular_z>`（如 `-0.30 0.0`）；相同值
     每次写入都会再次发布。停止写入后机器人会因运动模块的消息超时保护自动
     停车，需要立即停车时显式写入 `0 0`；收到 `ERR ...` 时按错误码提示用户。
 
 区域语音：
 
-24. 使用区域语音前，先订阅 Zone Voice 特征值的 Notify，以收到的 `PLAYING` /
+19. 使用区域语音前，先订阅 Zone Voice 特征值的 Notify，以收到的 `PLAYING` /
     `IDLE` / `UNKNOWN` 为准更新界面；播放前先 `LIST` 获取文件名，再写入
     `PLAY <file>`（文件名必须与列表完全一致，含扩展名、区分大小写）。
     自然结束以机器人主动推送的 `IDLE` 为准，不必轮询 `STATUS`。
 
 初始位姿设置：
 
-25. 需要重新校准时向 Initial Pose 特征值写入任意非空内容（如 `1`），以收到
+20. 需要重新校准时向 Initial Pose 特征值写入任意非空内容（如 `1`），以收到
     `OK` 确认消息已发布；位姿参数由机器人固定，App 不传也不显示坐标。
     `OK` 不代表重定位已完成，界面应以重新定位是否收敛的实际效果为准。

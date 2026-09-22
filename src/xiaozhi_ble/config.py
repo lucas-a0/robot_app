@@ -49,10 +49,6 @@ class BridgeConfig:
         return default
 
     @property
-    def control_socket_path(self) -> str:
-        return self._str("control_socket_path", "/tmp/xiaozhi-control.sock")
-
-    @property
     def bluetooth_adapter(self) -> str:
         return self._str("bluetooth.adapter", "/org/bluez/hci0")
 
@@ -179,35 +175,42 @@ class BridgeConfig:
         return 10.0
 
     @property
-    def latency_poll_interval_secs(self) -> float:
+    def lan_host(self) -> str:
+        return self._str("lan.host", "0.0.0.0")
+
+    @property
+    def lan_port(self) -> int:
         try:
-            value = self._get_nested("latency.poll_interval_secs")
+            value = self._get_nested("lan.port")
+        except KeyError:
+            return 4205
+        if isinstance(value, int) and 1 <= value <= 65535:
+            return value
+        return 4205
+
+    @property
+    def audio_query_host(self) -> str:
+        return self._str("audio.query_host", "127.0.0.1")
+
+    @property
+    def audio_query_port(self) -> int:
+        try:
+            value = self._get_nested("audio.query_port")
+        except KeyError:
+            return 4204
+        if isinstance(value, int) and 1 <= value <= 65535:
+            return value
+        return 4204
+
+    @property
+    def audio_poll_interval_secs(self) -> float:
+        try:
+            value = self._get_nested("audio.poll_interval_secs")
         except KeyError:
             return 5.0
         if isinstance(value, (int, float)) and value > 0:
             return float(value)
         return 5.0
-
-    @property
-    def latency_notify_threshold_ms(self) -> float:
-        """Minimum latency change (milliseconds) that triggers a notify."""
-        try:
-            value = self._get_nested("latency.notify_threshold_ms")
-        except KeyError:
-            return 10.0
-        if isinstance(value, (int, float)) and value >= 0:
-            return float(value)
-        return 10.0
-
-    @property
-    def latency_connect_timeout_secs(self) -> float:
-        try:
-            value = self._get_nested("latency.connect_timeout_secs")
-        except KeyError:
-            return 2.0
-        if isinstance(value, (int, float)) and value > 0:
-            return float(value)
-        return 2.0
 
     @property
     def robot_control_commands(self) -> dict[str, str]:
@@ -229,6 +232,11 @@ class BridgeConfig:
                     flush=True,
                 )
         return commands
+
+    @property
+    def robot_control_topic(self) -> str:
+        """Topic for motion commands (std_msgs/String); empty disables them."""
+        return self._str("robot_control.topic", "/xiaozhi_topic")
 
     @property
     def robot_control_call_timeout_secs(self) -> float:

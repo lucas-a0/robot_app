@@ -1,9 +1,9 @@
-"""BlueZ GATT server for push-to-talk control.
+"""BlueZ GATT server for the robot control bridge.
 
-This module runs the BLE peripheral side of the bridge. It does not talk to
-the voice client directly; command and URL callbacks forward to the xiaozhi
-control socket (see control_client.py) and return the socket response, which
-is then relayed to the BLE App as a notification.
+This module runs the BLE peripheral side of the bridge. Command callbacks
+dispatch into bridge-local providers (robot control, WiFi, navigation, …);
+status characteristics are updated from those providers via notify_* methods.
+LAN TCP is a parallel transport assembled in main.py, not here.
 """
 
 import threading
@@ -21,14 +21,10 @@ from .wifi_config import WifiRequestError, parse_wifi_request
 
 
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
-COMMAND_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
-URL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
-ERROR_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef3"
 BATTERY_STATUS_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef4"
 NETWORK_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef5"
 CPU_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef6"
 BANDWIDTH_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef7"
-LATENCY_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef8"
 ROBOT_CONTROL_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef9"
 WIFI_CONFIG_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefa"
 NAV_TASK_CHAR_UUID = "12345678-1234-5678-1234-56789abcdefb"
@@ -39,19 +35,17 @@ ZONE_VOICE_CHAR_UUID = "12345678-1234-5678-1234-56789abcdeff"
 # The abcdefN tail is exhausted; new characteristics continue with the
 # abcd0NN series (see AGENTS.md section 3).
 INITIAL_POSE_CHAR_UUID = "12345678-1234-5678-1234-56789abcd010"
+LAN_ENDPOINT_CHAR_UUID = "12345678-1234-5678-1234-56789abcd011"
+AUDIO_ENDPOINT_CHAR_UUID = "12345678-1234-5678-1234-56789abcd012"
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 
 BLUEZ_SERVICE_NAME = "org.bluez"
 APP_PATH = "/org/xiaozhi/ble_app"
 SERVICE_PATH = f"{APP_PATH}/service0"
-CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char0"
-URL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char1"
-ERROR_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char2"
 BATTERY_STATUS_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char3"
 NETWORK_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char4"
 CPU_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char5"
 BANDWIDTH_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char6"
-LATENCY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char7"
 ROBOT_CONTROL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char8"
 WIFI_CONFIG_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char9"
 NAV_TASK_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char10"
@@ -60,16 +54,14 @@ CMD_VEL_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char12"
 MEMORY_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char13"
 ZONE_VOICE_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char14"
 INITIAL_POSE_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char15"
-CHARACTERISTIC_CCCD_PATH = f"{CHARACTERISTIC_PATH}/desc0"
-URL_CHARACTERISTIC_CCCD_PATH = f"{URL_CHARACTERISTIC_PATH}/desc0"
-ERROR_CHARACTERISTIC_CCCD_PATH = f"{ERROR_CHARACTERISTIC_PATH}/desc0"
+LAN_ENDPOINT_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char16"
+AUDIO_ENDPOINT_CHARACTERISTIC_PATH = f"{SERVICE_PATH}/char17"
 BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH = (
     f"{BATTERY_STATUS_CHARACTERISTIC_PATH}/desc0"
 )
 NETWORK_CHARACTERISTIC_CCCD_PATH = f"{NETWORK_CHARACTERISTIC_PATH}/desc0"
 CPU_CHARACTERISTIC_CCCD_PATH = f"{CPU_CHARACTERISTIC_PATH}/desc0"
 BANDWIDTH_CHARACTERISTIC_CCCD_PATH = f"{BANDWIDTH_CHARACTERISTIC_PATH}/desc0"
-LATENCY_CHARACTERISTIC_CCCD_PATH = f"{LATENCY_CHARACTERISTIC_PATH}/desc0"
 ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH = f"{ROBOT_CONTROL_CHARACTERISTIC_PATH}/desc0"
 WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH = f"{WIFI_CONFIG_CHARACTERISTIC_PATH}/desc0"
 NAV_TASK_CHARACTERISTIC_CCCD_PATH = f"{NAV_TASK_CHARACTERISTIC_PATH}/desc0"
@@ -82,11 +74,6 @@ INITIAL_POSE_CHARACTERISTIC_CCCD_PATH = (
 )
 ADVERTISEMENT_PATH = "/org/xiaozhi/ble_adv"
 
-# Receives (command, reason), returns the response text relayed to the App,
-# e.g. "OK start" or "ERR VOICE_UNAVAILABLE ...".
-CommandCallback = Callable[[str, str], str]
-UrlCallback = Callable[[str], None]
-ErrorCallback = Callable[[str, str], None]
 # Receives the command name, returns an immediate error text relayed to the
 # App (e.g. "ERR command"), or None when the command was dispatched and its
 # result is reported asynchronously.
@@ -116,15 +103,6 @@ ZoneVoiceCallback = Callable[[str], str]
 InitialPoseCallback = Callable[[str], str]
 
 
-class BridgeError(Exception):
-    """A control-socket failure with a protocol error code."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
-
-
 def _read_bytes(value: List[Byte], options: Dict[Str, Variant]) -> List[Byte]:
     """Apply a BlueZ long-read offset to a characteristic value."""
     offset = options.get("offset")
@@ -141,295 +119,6 @@ def _bounded_text(text: str, limit: int = 180) -> str:
     """Keep notifications within the negotiated ATT payload budget."""
     data = text.encode("utf-8")[:limit]
     return data.decode("utf-8", errors="ignore")
-
-
-@dbus_interface("org.bluez.GattCharacteristic1")
-class CommandCharacteristic(InterfaceTemplate):
-    """Receive start/stop writes and publish acknowledgements and state."""
-
-    def __init__(
-        self,
-        callback: CommandCallback,
-        initial_state: str = "idle",
-        on_disconnect: Callable[[], None] | None = None,
-    ) -> None:
-        super().__init__(self)
-        self._callback = callback
-        self._on_disconnect = on_disconnect
-        self._flags = ["read", "write", "notify"]
-        self._notifying = False
-        self._pressed = False
-        self._state = initial_state
-        self._value: List[Byte] = list(f"STATE {initial_state}".encode("utf-8"))
-
-    @property
-    def UUID(self) -> Str:
-        return COMMAND_CHAR_UUID
-
-    @property
-    def Service(self) -> ObjPath:
-        return SERVICE_PATH
-
-    @property
-    def Flags(self) -> List[Str]:
-        return self._flags
-
-    @property
-    def Descriptors(self) -> List[ObjPath]:
-        return [CHARACTERISTIC_CCCD_PATH]
-
-    @property
-    def Value(self) -> List[Byte]:
-        return self._value
-
-    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
-        """Return the most recently published response or state."""
-        return _read_bytes(self._value, options)
-
-    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
-        """Handle a UTF-8 start or stop command."""
-        try:
-            command = bytes(value).decode("utf-8").strip().lower()
-        except UnicodeDecodeError:
-            self._notify("ERR encoding")
-            return
-
-        logger.info(f"Received BLE command: {command!r}")
-        if command == "start":
-            if not self._notifying:
-                logger.warning("Ignoring BLE start before notifications are enabled")
-                return
-            if self._pressed:
-                self._notify("OK start")
-                return
-            try:
-                response = self._callback("start", "bluetooth")
-            except Exception:
-                logger.exception("Failed to dispatch BLE start command")
-                self._notify("ERR internal")
-                return
-            if response.startswith("OK"):
-                self._pressed = True
-            self._notify(response)
-            return
-
-        if command == "stop":
-            try:
-                response = self._callback("stop", "bluetooth")
-            except Exception:
-                logger.exception("Failed to dispatch BLE stop command")
-                self._notify("ERR internal")
-                return
-            if response.startswith("OK"):
-                self._pressed = False
-            self._notify(response)
-            return
-
-        self._notify("ERR command")
-
-    def StartNotify(self) -> None:
-        """Enable notifications and immediately publish current state."""
-        logger.info("BLE notifications enabled")
-        self._notifying = True
-        self._notify(f"STATE {self._state}")
-
-    def StopNotify(self) -> None:
-        """Stop notifications and release an outstanding push-to-talk press."""
-        logger.info("BLE notifications disabled or client disconnected")
-        self._notifying = False
-        self._force_stop("bluetooth_disconnect")
-        # Also fires when the App merely unsubscribes; the hook must stay
-        # harmless in that case.
-        if self._on_disconnect is not None:
-            try:
-                self._on_disconnect()
-            except Exception:
-                logger.exception("Failed to dispatch BLE disconnect hook")
-
-    def update_state(self, state: str) -> None:
-        """Store and notify the current application state."""
-        self._state = state
-        if self._notifying:
-            self._notify(f"STATE {state}")
-
-    def force_stop(self, reason: str) -> None:
-        """Release an outstanding press while shutting down the BLE server."""
-        self._force_stop(reason)
-
-    def _force_stop(self, reason: str) -> None:
-        if not self._pressed:
-            return
-        self._pressed = False
-        try:
-            self._callback("stop", reason)
-        except Exception:
-            logger.exception("Failed to dispatch automatic BLE stop command")
-
-    def _notify(self, text: str) -> None:
-        data = list(_bounded_text(text).encode("utf-8"))
-        self._value = data
-        if not self._notifying:
-            return
-        try:
-            self.PropertiesChanged(
-                "org.bluez.GattCharacteristic1",
-                {"Value": Variant("ay", data)},
-                [],
-            )
-        except Exception:
-            logger.exception(f"Failed to emit BLE notification: {text!r}")
-            return
-        logger.debug(f"Sent BLE notification: {text!r}")
-
-
-@dbus_interface("org.bluez.GattCharacteristic1")
-class WebsocketUrlCharacteristic(InterfaceTemplate):
-    """Read and write the persisted WebSocket URL over BLE."""
-
-    def __init__(
-        self,
-        callback: UrlCallback,
-        initial_url: str,
-        on_error: ErrorCallback,
-    ) -> None:
-        super().__init__(self)
-        self._callback = callback
-        self._on_error = on_error
-        self._flags = [
-            "read",
-            "write",
-            "notify",
-        ]
-        self._notifying = False
-        self._value: List[Byte] = list(_bounded_text(initial_url).encode("utf-8"))
-
-    @property
-    def UUID(self) -> Str:
-        return URL_CHAR_UUID
-
-    @property
-    def Service(self) -> ObjPath:
-        return SERVICE_PATH
-
-    @property
-    def Flags(self) -> List[Str]:
-        return self._flags
-
-    @property
-    def Descriptors(self) -> List[ObjPath]:
-        return [URL_CHARACTERISTIC_CCCD_PATH]
-
-    @property
-    def Value(self) -> List[Byte]:
-        return self._value
-
-    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
-        return _read_bytes(self._value, options)
-
-    def WriteValue(self, value: List[Byte], options: Dict[Str, Variant]) -> None:
-        try:
-            url = bytes(value).decode("utf-8").strip()
-        except UnicodeDecodeError:
-            self._on_error("CONFIG_ENCODING", "URL is not valid UTF-8")
-            return
-        if not url:
-            self._on_error("CONFIG_INVALID", "URL must not be empty")
-            return
-        try:
-            self._callback(url)
-        except BridgeError as exc:
-            self._on_error(exc.code, exc.message)
-            return
-        except Exception as exc:
-            logger.exception("Failed to dispatch BLE URL update")
-            self._on_error("CONFIG_INTERNAL", str(exc))
-            return
-        logger.info(f"Received BLE websocket URL update: {url!r}")
-
-    def StartNotify(self) -> None:
-        self._notifying = True
-        self._notify()
-
-    def StopNotify(self) -> None:
-        self._notifying = False
-
-    def update_url(self, url: str) -> None:
-        self._value = list(_bounded_text(url).encode("utf-8"))
-        if self._notifying:
-            self._notify()
-
-    def _notify(self) -> None:
-        try:
-            self.PropertiesChanged(
-                "org.bluez.GattCharacteristic1",
-                {"Value": Variant("ay", self._value)},
-                [],
-            )
-        except Exception:
-            logger.exception("Failed to emit BLE websocket URL notification")
-            return
-        logger.debug(f"Sent BLE websocket URL: {bytes(self._value)!r}")
-
-
-@dbus_interface("org.bluez.GattCharacteristic1")
-class ErrorCharacteristic(InterfaceTemplate):
-    """Publish the latest connection or configuration error over BLE."""
-
-    def __init__(self, initial_error: tuple[str, str] | None = None) -> None:
-        super().__init__(self)
-        self._flags = ["read", "notify"]
-        self._notifying = False
-        self._value: List[Byte] = []
-        self.publish(*(initial_error or ("NONE", "")), notify=False)
-
-    @property
-    def UUID(self) -> Str:
-        return ERROR_CHAR_UUID
-
-    @property
-    def Service(self) -> ObjPath:
-        return SERVICE_PATH
-
-    @property
-    def Flags(self) -> List[Str]:
-        return self._flags
-
-    @property
-    def Descriptors(self) -> List[ObjPath]:
-        return [ERROR_CHARACTERISTIC_CCCD_PATH]
-
-    @property
-    def Value(self) -> List[Byte]:
-        return self._value
-
-    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
-        return _read_bytes(self._value, options)
-
-    def StartNotify(self) -> None:
-        self._notifying = True
-        self._notify()
-
-    def StopNotify(self) -> None:
-        self._notifying = False
-
-    def publish(self, code: str, message: str, notify: bool = True) -> None:
-        clean_message = " ".join(str(message).splitlines())
-        text = "NONE" if code == "NONE" else f"ERROR {code} {clean_message}".strip()
-        self._value = list(_bounded_text(text).encode("utf-8"))
-        if notify and self._notifying:
-            self._notify()
-
-    def _notify(self) -> None:
-        try:
-            self.PropertiesChanged(
-                "org.bluez.GattCharacteristic1",
-                {"Value": Variant("ay", self._value)},
-                [],
-            )
-        except Exception:
-            logger.exception("Failed to emit BLE error notification")
-            return
-        logger.debug(f"Sent BLE error: {bytes(self._value)!r}")
 
 
 @dbus_interface("org.bluez.GattCharacteristic1")
@@ -708,67 +397,6 @@ class BandwidthStatusCharacteristic(InterfaceTemplate):
             logger.exception("Failed to emit BLE bandwidth notification")
             return
         logger.debug(f"Sent BLE bandwidth: {bytes(self._value)!r}")
-
-
-@dbus_interface("org.bluez.GattCharacteristic1")
-class LatencyStatusCharacteristic(InterfaceTemplate):
-    """Publish the dialogue-server connect latency; notify only on change."""
-
-    def __init__(self) -> None:
-        super().__init__(self)
-        self._flags = ["read", "notify"]
-        self._notifying = False
-        # UNKNOWN until the latency provider gets a URL and its first probe.
-        self._value: List[Byte] = list(b"UNKNOWN")
-
-    @property
-    def UUID(self) -> Str:
-        return LATENCY_CHAR_UUID
-
-    @property
-    def Service(self) -> ObjPath:
-        return SERVICE_PATH
-
-    @property
-    def Flags(self) -> List[Str]:
-        return self._flags
-
-    @property
-    def Descriptors(self) -> List[ObjPath]:
-        return [LATENCY_CHARACTERISTIC_CCCD_PATH]
-
-    @property
-    def Value(self) -> List[Byte]:
-        return self._value
-
-    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
-        return _read_bytes(self._value, options)
-
-    def StartNotify(self) -> None:
-        self._notifying = True
-        self._notify()
-
-    def StopNotify(self) -> None:
-        self._notifying = False
-
-    def update_latency(self, latency_ms: float | None, notify: bool = True) -> None:
-        # None means the server is unreachable, not "no reading yet".
-        text = "LATENCY -" if latency_ms is None else f"LATENCY {latency_ms:.0f}"
-        self._value = list(_bounded_text(text).encode("utf-8"))
-        if notify and self._notifying:
-            self._notify()
-
-    def _notify(self) -> None:
-        try:
-            self.PropertiesChanged(
-                "org.bluez.GattCharacteristic1",
-                {"Value": Variant("ay", self._value)},
-                [],
-            )
-        except Exception:
-            logger.exception("Failed to emit BLE latency notification")
-            return
-        logger.debug(f"Sent BLE latency: {bytes(self._value)!r}")
 
 
 @dbus_interface("org.bluez.GattCharacteristic1")
@@ -1476,9 +1104,81 @@ class ClientCharacteristicConfigurationDescriptor(InterfaceTemplate):
             self._stop_notify()
 
 
+@dbus_interface("org.bluez.GattCharacteristic1")
+class LanEndpointCharacteristic(InterfaceTemplate):
+    """Read-only LAN control endpoint (``<ipv4> <port>``). No Notify."""
+
+    def __init__(self) -> None:
+        super().__init__(self)
+        self._flags = ["read"]
+        self._value: List[Byte] = list(b"UNKNOWN")
+
+    @property
+    def UUID(self) -> Str:
+        return LAN_ENDPOINT_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return []
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        return _read_bytes(self._value, options)
+
+    def update_endpoint(self, text: str) -> None:
+        self._value = list(_bounded_text(text).encode("utf-8"))
+
+
+@dbus_interface("org.bluez.GattCharacteristic1")
+class AudioEndpointCharacteristic(InterfaceTemplate):
+    """Read-only PCM playback endpoint (``<ipv4> <port>``). No Notify."""
+
+    def __init__(self) -> None:
+        super().__init__(self)
+        self._flags = ["read"]
+        self._value: List[Byte] = list(b"UNKNOWN")
+
+    @property
+    def UUID(self) -> Str:
+        return AUDIO_ENDPOINT_CHAR_UUID
+
+    @property
+    def Service(self) -> ObjPath:
+        return SERVICE_PATH
+
+    @property
+    def Flags(self) -> List[Str]:
+        return self._flags
+
+    @property
+    def Descriptors(self) -> List[ObjPath]:
+        return []
+
+    @property
+    def Value(self) -> List[Byte]:
+        return self._value
+
+    def ReadValue(self, options: Dict[Str, Variant]) -> List[Byte]:
+        return _read_bytes(self._value, options)
+
+    def update_endpoint(self, text: str) -> None:
+        self._value = list(_bounded_text(text).encode("utf-8"))
+
+
 @dbus_interface("org.bluez.GattService1")
 class ControlService(InterfaceTemplate):
-    """Primary GATT service containing the control characteristic."""
+    """Primary GATT service containing the control characteristics."""
 
     def __init__(self) -> None:
         super().__init__(self)
@@ -1494,14 +1194,10 @@ class ControlService(InterfaceTemplate):
     @property
     def Characteristics(self) -> List[ObjPath]:
         return [
-            CHARACTERISTIC_PATH,
-            URL_CHARACTERISTIC_PATH,
-            ERROR_CHARACTERISTIC_PATH,
             BATTERY_STATUS_CHARACTERISTIC_PATH,
             NETWORK_CHARACTERISTIC_PATH,
             CPU_CHARACTERISTIC_PATH,
             BANDWIDTH_CHARACTERISTIC_PATH,
-            LATENCY_CHARACTERISTIC_PATH,
             ROBOT_CONTROL_CHARACTERISTIC_PATH,
             WIFI_CONFIG_CHARACTERISTIC_PATH,
             NAV_TASK_CHARACTERISTIC_PATH,
@@ -1510,6 +1206,8 @@ class ControlService(InterfaceTemplate):
             MEMORY_CHARACTERISTIC_PATH,
             ZONE_VOICE_CHARACTERISTIC_PATH,
             INITIAL_POSE_CHARACTERISTIC_PATH,
+            LAN_ENDPOINT_CHARACTERISTIC_PATH,
+            AUDIO_ENDPOINT_CHARACTERISTIC_PATH,
         ]
 
 
@@ -1574,14 +1272,10 @@ class GattApplication(InterfaceTemplate):
                     "Characteristics": Variant(
                         "ao",
                         [
-                            CHARACTERISTIC_PATH,
-                            URL_CHARACTERISTIC_PATH,
-                            ERROR_CHARACTERISTIC_PATH,
                             BATTERY_STATUS_CHARACTERISTIC_PATH,
                             NETWORK_CHARACTERISTIC_PATH,
                             CPU_CHARACTERISTIC_PATH,
                             BANDWIDTH_CHARACTERISTIC_PATH,
-                            LATENCY_CHARACTERISTIC_PATH,
                             ROBOT_CONTROL_CHARACTERISTIC_PATH,
                             WIFI_CONFIG_CHARACTERISTIC_PATH,
                             NAV_TASK_CHARACTERISTIC_PATH,
@@ -1590,35 +1284,10 @@ class GattApplication(InterfaceTemplate):
                             MEMORY_CHARACTERISTIC_PATH,
                             ZONE_VOICE_CHARACTERISTIC_PATH,
                             INITIAL_POSE_CHARACTERISTIC_PATH,
+                            LAN_ENDPOINT_CHARACTERISTIC_PATH,
+                            AUDIO_ENDPOINT_CHARACTERISTIC_PATH,
                         ],
                     ),
-                }
-            },
-            CHARACTERISTIC_PATH: {
-                "org.bluez.GattCharacteristic1": {
-                    "UUID": Variant("s", COMMAND_CHAR_UUID),
-                    "Service": Variant("o", SERVICE_PATH),
-                    "Flags": Variant("as", ["read", "write", "notify"]),
-                    "Descriptors": Variant("ao", [CHARACTERISTIC_CCCD_PATH]),
-                }
-            },
-            URL_CHARACTERISTIC_PATH: {
-                "org.bluez.GattCharacteristic1": {
-                    "UUID": Variant("s", URL_CHAR_UUID),
-                    "Service": Variant("o", SERVICE_PATH),
-                    "Flags": Variant(
-                        "as",
-                        ["read", "write", "notify"],
-                    ),
-                    "Descriptors": Variant("ao", [URL_CHARACTERISTIC_CCCD_PATH]),
-                }
-            },
-            ERROR_CHARACTERISTIC_PATH: {
-                "org.bluez.GattCharacteristic1": {
-                    "UUID": Variant("s", ERROR_CHAR_UUID),
-                    "Service": Variant("o", SERVICE_PATH),
-                    "Flags": Variant("as", ["read", "notify"]),
-                    "Descriptors": Variant("ao", [ERROR_CHARACTERISTIC_CCCD_PATH]),
                 }
             },
             BATTERY_STATUS_CHARACTERISTIC_PATH: {
@@ -1654,16 +1323,6 @@ class GattApplication(InterfaceTemplate):
                     "Flags": Variant("as", ["read", "notify"]),
                     "Descriptors": Variant(
                         "ao", [BANDWIDTH_CHARACTERISTIC_CCCD_PATH]
-                    ),
-                }
-            },
-            LATENCY_CHARACTERISTIC_PATH: {
-                "org.bluez.GattCharacteristic1": {
-                    "UUID": Variant("s", LATENCY_CHAR_UUID),
-                    "Service": Variant("o", SERVICE_PATH),
-                    "Flags": Variant("as", ["read", "notify"]),
-                    "Descriptors": Variant(
-                        "ao", [LATENCY_CHARACTERISTIC_CCCD_PATH]
                     ),
                 }
             },
@@ -1745,25 +1404,20 @@ class GattApplication(InterfaceTemplate):
                     ),
                 }
             },
-            CHARACTERISTIC_CCCD_PATH: {
-                "org.bluez.GattDescriptor1": {
-                    "UUID": Variant("s", CCCD_UUID),
-                    "Characteristic": Variant("o", CHARACTERISTIC_PATH),
-                    "Flags": Variant("as", ["read", "write"]),
+            LAN_ENDPOINT_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", LAN_ENDPOINT_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read"]),
+                    "Descriptors": Variant("ao", []),
                 }
             },
-            URL_CHARACTERISTIC_CCCD_PATH: {
-                "org.bluez.GattDescriptor1": {
-                    "UUID": Variant("s", CCCD_UUID),
-                    "Characteristic": Variant("o", URL_CHARACTERISTIC_PATH),
-                    "Flags": Variant("as", ["read", "write"]),
-                }
-            },
-            ERROR_CHARACTERISTIC_CCCD_PATH: {
-                "org.bluez.GattDescriptor1": {
-                    "UUID": Variant("s", CCCD_UUID),
-                    "Characteristic": Variant("o", ERROR_CHARACTERISTIC_PATH),
-                    "Flags": Variant("as", ["read", "write"]),
+            AUDIO_ENDPOINT_CHARACTERISTIC_PATH: {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": Variant("s", AUDIO_ENDPOINT_CHAR_UUID),
+                    "Service": Variant("o", SERVICE_PATH),
+                    "Flags": Variant("as", ["read"]),
+                    "Descriptors": Variant("ao", []),
                 }
             },
             BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH: {
@@ -1791,13 +1445,6 @@ class GattApplication(InterfaceTemplate):
                 "org.bluez.GattDescriptor1": {
                     "UUID": Variant("s", CCCD_UUID),
                     "Characteristic": Variant("o", BANDWIDTH_CHARACTERISTIC_PATH),
-                    "Flags": Variant("as", ["read", "write"]),
-                }
-            },
-            LATENCY_CHARACTERISTIC_CCCD_PATH: {
-                "org.bluez.GattDescriptor1": {
-                    "UUID": Variant("s", CCCD_UUID),
-                    "Characteristic": Variant("o", LATENCY_CHARACTERISTIC_PATH),
                     "Flags": Variant("as", ["read", "write"]),
                 }
             },
@@ -1865,14 +1512,9 @@ class BleControlServer:
 
     def __init__(
         self,
-        callback: CommandCallback,
         adapter_path: str = "/org/bluez/hci0",
         device_name: str = "Xiaozhi",
-        initial_state: str = "idle",
-        initial_url: str = "",
-        initial_error: tuple[str, str] | None = None,
         initial_battery_status: tuple[float | None, str | None] = (None, None),
-        url_callback: UrlCallback | None = None,
         robot_control_callback: RobotControlCallback | None = None,
         wifi_config_callback: WifiConfigCallback | None = None,
         nav_task_callback: NavTaskCallback | None = None,
@@ -1881,8 +1523,6 @@ class BleControlServer:
         zone_voice_callback: ZoneVoiceCallback | None = None,
         initial_pose_callback: InitialPoseCallback | None = None,
     ) -> None:
-        self._callback = callback
-        self._url_callback = url_callback or (lambda _url: None)
         self._robot_control_callback = robot_control_callback or (
             lambda _command: "ERR unavailable"
         )
@@ -1910,9 +1550,6 @@ class BleControlServer:
         )
         self._adapter_path = adapter_path
         self._device_name = device_name
-        self._initial_state = initial_state
-        self._initial_url = initial_url
-        self._initial_error = initial_error
         self._initial_battery_status = initial_battery_status
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -1928,14 +1565,10 @@ class BleControlServer:
         self._dbus_daemon_proxy = None
         self._gatt_manager = None
         self._advertising_manager = None
-        self._characteristic: CommandCharacteristic | None = None
-        self._url_characteristic: WebsocketUrlCharacteristic | None = None
-        self._error_characteristic: ErrorCharacteristic | None = None
         self._battery_characteristic: BatteryStatusCharacteristic | None = None
         self._network_characteristic: NetworkStatusCharacteristic | None = None
         self._cpu_characteristic: CpuStatusCharacteristic | None = None
         self._bandwidth_characteristic: BandwidthStatusCharacteristic | None = None
-        self._latency_characteristic: LatencyStatusCharacteristic | None = None
         self._robot_control_characteristic: RobotControlCharacteristic | None = None
         self._wifi_config_characteristic: WifiConfigCharacteristic | None = None
         self._nav_task_characteristic: NavTaskCharacteristic | None = None
@@ -1944,6 +1577,8 @@ class BleControlServer:
         self._memory_characteristic: MemoryStatusCharacteristic | None = None
         self._zone_voice_characteristic: ZoneVoiceCharacteristic | None = None
         self._initial_pose_characteristic: InitialPoseCharacteristic | None = None
+        self._lan_endpoint_characteristic: LanEndpointCharacteristic | None = None
+        self._audio_endpoint_characteristic: AudioEndpointCharacteristic | None = None
 
     @property
     def error(self) -> str | None:
@@ -1983,38 +1618,26 @@ class BleControlServer:
         if self._thread.is_alive():
             logger.warning(f"BLE server did not stop within {timeout:.1f}s")
 
-    def notify_state(self, state: str) -> None:
-        """Publish an application state from any thread."""
-        if self._characteristic is None:
+    def update_lan_endpoint(self, text: str) -> None:
+        """Update the cached LAN endpoint (read-only, no Notify)."""
+        if self._lan_endpoint_characteristic is None:
             return
 
         def update() -> bool:
-            if self._characteristic is not None:
-                self._characteristic.update_state(state)
+            if self._lan_endpoint_characteristic is not None:
+                self._lan_endpoint_characteristic.update_endpoint(text)
             return False
 
         GLib.idle_add(update)
 
-    def notify_websocket_url(self, url: str) -> None:
-        """Publish the URL after it has been persisted and applied."""
-        if self._url_characteristic is None:
+    def update_audio_endpoint(self, text: str) -> None:
+        """Update the cached audio endpoint (read-only, no Notify)."""
+        if self._audio_endpoint_characteristic is None:
             return
 
         def update() -> bool:
-            if self._url_characteristic is not None:
-                self._url_characteristic.update_url(url)
-            return False
-
-        GLib.idle_add(update)
-
-    def notify_error(self, code: str, message: str) -> None:
-        """Publish an error from any thread."""
-        if self._error_characteristic is None:
-            return
-
-        def update() -> bool:
-            if self._error_characteristic is not None:
-                self._error_characteristic.publish(code, message)
+            if self._audio_endpoint_characteristic is not None:
+                self._audio_endpoint_characteristic.update_endpoint(text)
             return False
 
         GLib.idle_add(update)
@@ -2095,18 +1718,6 @@ class BleControlServer:
 
         GLib.idle_add(update)
 
-    def notify_latency(self, latency_ms: float | None) -> None:
-        """Update the dialogue-server latency from any thread."""
-        if self._latency_characteristic is None:
-            return
-
-        def update() -> bool:
-            if self._latency_characteristic is not None:
-                self._latency_characteristic.update_latency(latency_ms)
-            return False
-
-        GLib.idle_add(update)
-
     def notify_robot_control_error(self, text: str) -> None:
         """Publish an asynchronous robot-control failure from any thread."""
         if self._robot_control_characteristic is None:
@@ -2159,24 +1770,12 @@ class BleControlServer:
         try:
             self._bus = SystemMessageBus()
             self._event_loop = EventLoop()
-            self._characteristic = CommandCharacteristic(
-                self._callback,
-                initial_state=self._initial_state,
-                on_disconnect=self._on_client_disconnected,
-            )
-            self._url_characteristic = WebsocketUrlCharacteristic(
-                self._url_callback,
-                self._initial_url,
-                self._publish_local_error,
-            )
-            self._error_characteristic = ErrorCharacteristic(self._initial_error)
             self._battery_characteristic = BatteryStatusCharacteristic(
                 *self._initial_battery_status
             )
             self._network_characteristic = NetworkStatusCharacteristic()
             self._cpu_characteristic = CpuStatusCharacteristic()
             self._bandwidth_characteristic = BandwidthStatusCharacteristic()
-            self._latency_characteristic = LatencyStatusCharacteristic()
             self._robot_control_characteristic = RobotControlCharacteristic(
                 self._robot_control_callback
             )
@@ -2199,85 +1798,75 @@ class BleControlServer:
             self._initial_pose_characteristic = InitialPoseCharacteristic(
                 self._initial_pose_callback
             )
-            command_cccd = ClientCharacteristicConfigurationDescriptor(
-                CHARACTERISTIC_PATH,
-                self._characteristic.StartNotify,
-                self._characteristic.StopNotify,
-            )
-            url_cccd = ClientCharacteristicConfigurationDescriptor(
-                URL_CHARACTERISTIC_PATH,
-                self._url_characteristic.StartNotify,
-                self._url_characteristic.StopNotify,
-            )
-            error_cccd = ClientCharacteristicConfigurationDescriptor(
-                ERROR_CHARACTERISTIC_PATH,
-                self._error_characteristic.StartNotify,
-                self._error_characteristic.StopNotify,
-            )
+            self._lan_endpoint_characteristic = LanEndpointCharacteristic()
+            self._audio_endpoint_characteristic = AudioEndpointCharacteristic()
+
+            def wrap_stop(stop: Callable[[], None]) -> Callable[[], None]:
+                def wrapped() -> None:
+                    stop()
+                    self._on_client_disconnected()
+
+                return wrapped
+
             battery_cccd = ClientCharacteristicConfigurationDescriptor(
                 BATTERY_STATUS_CHARACTERISTIC_PATH,
                 self._battery_characteristic.StartNotify,
-                self._battery_characteristic.StopNotify,
+                wrap_stop(self._battery_characteristic.StopNotify),
             )
             network_cccd = ClientCharacteristicConfigurationDescriptor(
                 NETWORK_CHARACTERISTIC_PATH,
                 self._network_characteristic.StartNotify,
-                self._network_characteristic.StopNotify,
+                wrap_stop(self._network_characteristic.StopNotify),
             )
             cpu_cccd = ClientCharacteristicConfigurationDescriptor(
                 CPU_CHARACTERISTIC_PATH,
                 self._cpu_characteristic.StartNotify,
-                self._cpu_characteristic.StopNotify,
+                wrap_stop(self._cpu_characteristic.StopNotify),
             )
             bandwidth_cccd = ClientCharacteristicConfigurationDescriptor(
                 BANDWIDTH_CHARACTERISTIC_PATH,
                 self._bandwidth_characteristic.StartNotify,
-                self._bandwidth_characteristic.StopNotify,
-            )
-            latency_cccd = ClientCharacteristicConfigurationDescriptor(
-                LATENCY_CHARACTERISTIC_PATH,
-                self._latency_characteristic.StartNotify,
-                self._latency_characteristic.StopNotify,
+                wrap_stop(self._bandwidth_characteristic.StopNotify),
             )
             robot_control_cccd = ClientCharacteristicConfigurationDescriptor(
                 ROBOT_CONTROL_CHARACTERISTIC_PATH,
                 self._robot_control_characteristic.StartNotify,
-                self._robot_control_characteristic.StopNotify,
+                wrap_stop(self._robot_control_characteristic.StopNotify),
             )
             wifi_config_cccd = ClientCharacteristicConfigurationDescriptor(
                 WIFI_CONFIG_CHARACTERISTIC_PATH,
                 self._wifi_config_characteristic.StartNotify,
-                self._wifi_config_characteristic.StopNotify,
+                wrap_stop(self._wifi_config_characteristic.StopNotify),
             )
             nav_task_cccd = ClientCharacteristicConfigurationDescriptor(
                 NAV_TASK_CHARACTERISTIC_PATH,
                 self._nav_task_characteristic.StartNotify,
-                self._nav_task_characteristic.StopNotify,
+                wrap_stop(self._nav_task_characteristic.StopNotify),
             )
             zone_nav_cccd = ClientCharacteristicConfigurationDescriptor(
                 ZONE_NAV_CHARACTERISTIC_PATH,
                 self._zone_nav_characteristic.StartNotify,
-                self._zone_nav_characteristic.StopNotify,
+                wrap_stop(self._zone_nav_characteristic.StopNotify),
             )
             cmd_vel_cccd = ClientCharacteristicConfigurationDescriptor(
                 CMD_VEL_CHARACTERISTIC_PATH,
                 self._cmd_vel_characteristic.StartNotify,
-                self._cmd_vel_characteristic.StopNotify,
+                wrap_stop(self._cmd_vel_characteristic.StopNotify),
             )
             memory_cccd = ClientCharacteristicConfigurationDescriptor(
                 MEMORY_CHARACTERISTIC_PATH,
                 self._memory_characteristic.StartNotify,
-                self._memory_characteristic.StopNotify,
+                wrap_stop(self._memory_characteristic.StopNotify),
             )
             zone_voice_cccd = ClientCharacteristicConfigurationDescriptor(
                 ZONE_VOICE_CHARACTERISTIC_PATH,
                 self._zone_voice_characteristic.StartNotify,
-                self._zone_voice_characteristic.StopNotify,
+                wrap_stop(self._zone_voice_characteristic.StopNotify),
             )
             initial_pose_cccd = ClientCharacteristicConfigurationDescriptor(
                 INITIAL_POSE_CHARACTERISTIC_PATH,
                 self._initial_pose_characteristic.StartNotify,
-                self._initial_pose_characteristic.StopNotify,
+                wrap_stop(self._initial_pose_characteristic.StopNotify),
             )
             service = ControlService()
             advertisement = ControlAdvertisement(
@@ -2287,12 +1876,6 @@ class BleControlServer:
 
             self._bus.publish_object(APP_PATH, GattApplication())
             self._bus.publish_object(SERVICE_PATH, service)
-            self._bus.publish_object(CHARACTERISTIC_PATH, self._characteristic)
-            self._bus.publish_object(CHARACTERISTIC_CCCD_PATH, command_cccd)
-            self._bus.publish_object(URL_CHARACTERISTIC_PATH, self._url_characteristic)
-            self._bus.publish_object(URL_CHARACTERISTIC_CCCD_PATH, url_cccd)
-            self._bus.publish_object(ERROR_CHARACTERISTIC_PATH, self._error_characteristic)
-            self._bus.publish_object(ERROR_CHARACTERISTIC_CCCD_PATH, error_cccd)
             self._bus.publish_object(
                 BATTERY_STATUS_CHARACTERISTIC_PATH,
                 self._battery_characteristic,
@@ -2316,13 +1899,6 @@ class BleControlServer:
             )
             self._bus.publish_object(
                 BANDWIDTH_CHARACTERISTIC_CCCD_PATH, bandwidth_cccd
-            )
-            self._bus.publish_object(
-                LATENCY_CHARACTERISTIC_PATH,
-                self._latency_characteristic,
-            )
-            self._bus.publish_object(
-                LATENCY_CHARACTERISTIC_CCCD_PATH, latency_cccd
             )
             self._bus.publish_object(
                 ROBOT_CONTROL_CHARACTERISTIC_PATH,
@@ -2377,6 +1953,14 @@ class BleControlServer:
             )
             self._bus.publish_object(
                 INITIAL_POSE_CHARACTERISTIC_CCCD_PATH, initial_pose_cccd
+            )
+            self._bus.publish_object(
+                LAN_ENDPOINT_CHARACTERISTIC_PATH,
+                self._lan_endpoint_characteristic,
+            )
+            self._bus.publish_object(
+                AUDIO_ENDPOINT_CHARACTERISTIC_PATH,
+                self._audio_endpoint_characteristic,
             )
             self._bus.publish_object(ADVERTISEMENT_PATH, advertisement)
             GLib.timeout_add_seconds(1, self._notify_battery)
@@ -2435,8 +2019,7 @@ class BleControlServer:
         self._registered = True
         logger.info(
             f"BLE control ready: name={self._device_name!r} "
-            f"service={SERVICE_UUID} command={COMMAND_CHAR_UUID} "
-            f"url={URL_CHAR_UUID} error={ERROR_CHAR_UUID}"
+            f"service={SERVICE_UUID}"
         )
         self._ready.set()
 
@@ -2539,16 +2122,18 @@ class BleControlServer:
         logger.info("BLE advertisement re-registered")
 
     def _on_client_disconnected(self) -> None:
-        """Schedule an advertisement refresh after Command notify stops.
+        """Schedule an advertisement refresh after any Notify CCCD stops.
 
         BlueZ is supposed to resume the registered advertisement on its own
         once a connection drops, but several adapter/driver combinations
         never re-activate it after the first connection, leaving the robot
         invisible to scans. There is no Device1.Connected watch; this hook
-        runs from CommandCharacteristic.StopNotify, so it also fires when
-        the App merely unsubscribes and does not fire if Command notify was
-        never enabled. The Unregister/Register refresh is idempotent; it
-        briefly opens an advertising gap even when BlueZ already resumed.
+        runs from every remaining characteristic's StopNotify (wrapped at
+        CCCD construction), so it also fires when the App merely
+        unsubscribes. The pending flag collapses multiple StopNotify calls
+        from one disconnect into a single refresh. The Unregister/Register
+        refresh is idempotent; it briefly opens an advertising gap even
+        when BlueZ already resumed.
         """
         if self._shutdown_requested or not self._gatt_registered:
             return
@@ -2557,7 +2142,7 @@ class BleControlServer:
         self._advertisement_refresh_pending = True
         self._advertisement_refresh_count += 1
         logger.info(
-            "Command notify stopped; scheduling BLE advertisement refresh "
+            "Notify stopped; scheduling BLE advertisement refresh "
             f"in 2s (count={self._advertisement_refresh_count})"
         )
         # Small delay: BlueZ processes the disconnection first.
@@ -2604,10 +2189,6 @@ class BleControlServer:
         self._ready.set()
         self._begin_shutdown()
 
-    def _publish_local_error(self, code: str, message: str) -> None:
-        if self._error_characteristic is not None:
-            self._error_characteristic.publish(code, message)
-
     def _notify_battery(self) -> bool:
         if self._battery_characteristic is not None:
             return self._battery_characteristic.tick()
@@ -2617,8 +2198,6 @@ class BleControlServer:
         if self._shutdown_requested:
             return False
         self._shutdown_requested = True
-        if self._characteristic is not None:
-            self._characteristic.force_stop("bluetooth_shutdown")
         self._registered = False
         if self._advertisement_registered:
             self._advertising_manager.UnregisterAdvertisement(

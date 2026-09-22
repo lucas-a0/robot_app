@@ -1,12 +1,14 @@
-"""Tests for the BLE push-to-talk GATT implementation."""
+"""Tests for the BLE GATT implementation."""
 
 from xiaozhi_ble.gatt_server import ADVERTISEMENT_PATH
+from xiaozhi_ble.gatt_server import AUDIO_ENDPOINT_CHAR_UUID
+from xiaozhi_ble.gatt_server import AUDIO_ENDPOINT_CHARACTERISTIC_PATH
+from xiaozhi_ble.gatt_server import AudioEndpointCharacteristic
 from xiaozhi_ble.gatt_server import BANDWIDTH_CHAR_UUID
 from xiaozhi_ble.gatt_server import BANDWIDTH_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHAR_UUID
 from xiaozhi_ble.gatt_server import BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CCCD_UUID
-from xiaozhi_ble.gatt_server import CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CMD_VEL_CHAR_UUID
 from xiaozhi_ble.gatt_server import CMD_VEL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import CmdVelCharacteristic
@@ -17,33 +19,25 @@ from xiaozhi_ble.gatt_server import NETWORK_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import BatteryStatusCharacteristic
 from xiaozhi_ble.gatt_server import BandwidthStatusCharacteristic
 from xiaozhi_ble.gatt_server import BleControlServer
-from xiaozhi_ble.gatt_server import BridgeError
-from xiaozhi_ble.gatt_server import ERROR_CHAR_UUID
-from xiaozhi_ble.gatt_server import ERROR_CHARACTERISTIC_CCCD_PATH
-from xiaozhi_ble.gatt_server import LATENCY_CHAR_UUID
-from xiaozhi_ble.gatt_server import LATENCY_CHARACTERISTIC_CCCD_PATH
-from xiaozhi_ble.gatt_server import LatencyStatusCharacteristic
 from xiaozhi_ble.gatt_server import MEMORY_CHAR_UUID
 from xiaozhi_ble.gatt_server import MEMORY_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import MemoryStatusCharacteristic
-from xiaozhi_ble.gatt_server import URL_CHAR_UUID
-from xiaozhi_ble.gatt_server import URL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import WIFI_CONFIG_CHAR_UUID
 from xiaozhi_ble.gatt_server import WifiConfigCharacteristic
-from xiaozhi_ble.gatt_server import CommandCharacteristic
 from xiaozhi_ble.gatt_server import ControlAdvertisement
 from xiaozhi_ble.gatt_server import CpuStatusCharacteristic
-from xiaozhi_ble.gatt_server import ErrorCharacteristic
 from xiaozhi_ble.gatt_server import GattApplication
 from xiaozhi_ble.gatt_server import INITIAL_POSE_CHAR_UUID
 from xiaozhi_ble.gatt_server import INITIAL_POSE_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import InitialPoseCharacteristic
+from xiaozhi_ble.gatt_server import LAN_ENDPOINT_CHAR_UUID
+from xiaozhi_ble.gatt_server import LAN_ENDPOINT_CHARACTERISTIC_PATH
+from xiaozhi_ble.gatt_server import LanEndpointCharacteristic
 from xiaozhi_ble.gatt_server import NetworkStatusCharacteristic
 from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHAR_UUID
 from xiaozhi_ble.gatt_server import ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import RobotControlCharacteristic
-from xiaozhi_ble.gatt_server import WebsocketUrlCharacteristic
 from xiaozhi_ble.gatt_server import ZONE_NAV_CHAR_UUID
 from xiaozhi_ble.gatt_server import ZONE_NAV_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import ZoneNavCharacteristic
@@ -52,149 +46,28 @@ from xiaozhi_ble.gatt_server import ZONE_VOICE_CHARACTERISTIC_CCCD_PATH
 from xiaozhi_ble.gatt_server import ZoneVoiceCharacteristic
 
 
-def _value(characteristic: CommandCharacteristic) -> str:
-    return bytes(characteristic.Value).decode("utf-8")
-
-
 def _unpack_properties(properties: dict) -> dict:
     return {key: value.unpack() for key, value in properties.items()}
 
 
-def _ok_callback(calls: list):
-    def callback(command: str, reason: str) -> str:
-        calls.append((command, reason))
-        return f"OK {command}"
+def test_lan_endpoint_characteristic_is_read_only():
+    characteristic = LanEndpointCharacteristic()
+    assert characteristic.Flags == ["read"]
+    assert characteristic.Descriptors == []
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
 
-    return callback
-
-
-def test_start_requires_notification_subscription():
-    calls = []
-    characteristic = CommandCharacteristic(_ok_callback(calls))
-    assert characteristic.Descriptors == [CHARACTERISTIC_CCCD_PATH]
-
-    characteristic.WriteValue(list(b"start"), {})
-
-    assert calls == []
-    assert _value(characteristic) == "STATE idle"
+    characteristic.update_endpoint("192.168.1.12 4205")
+    assert bytes(characteristic.Value).decode("utf-8") == "192.168.1.12 4205"
 
 
-def test_start_is_idempotent_and_disconnect_stops():
-    calls = []
-    characteristic = CommandCharacteristic(_ok_callback(calls))
-    characteristic.StartNotify()
+def test_audio_endpoint_characteristic_is_read_only():
+    characteristic = AudioEndpointCharacteristic()
+    assert characteristic.Flags == ["read"]
+    assert characteristic.Descriptors == []
+    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
 
-    characteristic.WriteValue(list(b"start"), {})
-    characteristic.WriteValue(list(b"START"), {})
-    characteristic.StopNotify()
-
-    assert calls == [
-        ("start", "bluetooth"),
-        ("stop", "bluetooth_disconnect"),
-    ]
-
-
-def test_explicit_stop_prevents_duplicate_disconnect_stop():
-    calls = []
-    characteristic = CommandCharacteristic(_ok_callback(calls))
-    characteristic.StartNotify()
-
-    characteristic.WriteValue(list(b"start"), {})
-    characteristic.WriteValue(list(b"stop"), {})
-    characteristic.StopNotify()
-
-    assert calls == [
-        ("start", "bluetooth"),
-        ("stop", "bluetooth"),
-    ]
-    assert _value(characteristic) == "OK stop"
-
-
-def test_failed_start_is_not_marked_pressed():
-    calls = []
-
-    def callback(command: str, reason: str) -> str:
-        calls.append((command, reason))
-        return "ERR VOICE_UNAVAILABLE control socket is not connected"
-
-    characteristic = CommandCharacteristic(callback)
-    characteristic.StartNotify()
-
-    characteristic.WriteValue(list(b"start"), {})
-    characteristic.StopNotify()
-
-    # The failed press must not trigger the automatic disconnect stop.
-    assert calls == [("start", "bluetooth")]
-    assert _value(characteristic).startswith("ERR VOICE_UNAVAILABLE")
-
-
-def test_errors_and_state_notifications_update_value():
-    calls = []
-    characteristic = CommandCharacteristic(_ok_callback(calls))
-    characteristic.StartNotify()
-
-    characteristic.WriteValue([0xff], {})
-    assert _value(characteristic) == "ERR encoding"
-
-    characteristic.WriteValue(list(b"unknown"), {})
-    assert _value(characteristic) == "ERR command"
-
-    characteristic.update_state("listening")
-    assert _value(characteristic) == "STATE listening"
-    assert calls == []
-
-
-def test_websocket_url_characteristic_dispatches_updates_and_errors():
-    calls = []
-    errors = []
-    characteristic = WebsocketUrlCharacteristic(
-        lambda url: calls.append(url),
-        "ws://old.example/ws",
-        lambda code, message: errors.append((code, message)),
-    )
-    assert characteristic.Flags == ["read", "write", "notify"]
-    assert characteristic.Descriptors == [URL_CHARACTERISTIC_CCCD_PATH]
-
-    characteristic.WriteValue(list(b"wss://new.example/ws"), {})
-    characteristic.WriteValue([0xff], {})
-    characteristic.WriteValue([], {})
-
-    assert calls == ["wss://new.example/ws"]
-    assert errors == [
-        ("CONFIG_ENCODING", "URL is not valid UTF-8"),
-        ("CONFIG_INVALID", "URL must not be empty"),
-    ]
-    characteristic.update_url("wss://new.example/ws")
-    assert bytes(characteristic.Value).decode("utf-8") == "wss://new.example/ws"
-
-
-def test_websocket_url_characteristic_relays_bridge_errors():
-    errors = []
-
-    def callback(url: str) -> None:
-        raise BridgeError("CONFIG_BUSY", "cannot change websocket_url while speaking")
-
-    characteristic = WebsocketUrlCharacteristic(
-        callback,
-        "ws://old.example/ws",
-        lambda code, message: errors.append((code, message)),
-    )
-
-    characteristic.WriteValue(list(b"wss://new.example/ws"), {})
-
-    assert errors == [("CONFIG_BUSY", "cannot change websocket_url while speaking")]
-
-
-def test_error_characteristic_publishes_bounded_status():
-    characteristic = ErrorCharacteristic()
-    assert characteristic.Descriptors == [ERROR_CHARACTERISTIC_CCCD_PATH]
-    assert bytes(characteristic.Value).decode("utf-8") == "NONE"
-
-    characteristic.publish("WS_ERROR", "connection failed")
-
-    assert bytes(characteristic.Value).decode("utf-8") == (
-        "ERROR WS_ERROR connection failed"
-    )
+    characteristic.update_endpoint("192.168.1.12 4203")
+    assert bytes(characteristic.Value).decode("utf-8") == "192.168.1.12 4203"
 
 
 def test_battery_status_characteristic_formats_percentage_and_supply_status():
@@ -278,22 +151,6 @@ def test_bandwidth_status_characteristic_formats_rates():
     characteristic.update_bandwidth(None, None)
 
     assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
-
-
-def test_latency_status_characteristic_formats_latency():
-    characteristic = LatencyStatusCharacteristic()
-    assert characteristic.Flags == ["read", "notify"]
-    assert characteristic.Descriptors == [LATENCY_CHARACTERISTIC_CCCD_PATH]
-    assert bytes(characteristic.Value).decode("utf-8") == "UNKNOWN"
-
-    characteristic.update_latency(37.4)
-
-    assert bytes(characteristic.Value).decode("utf-8") == "LATENCY 37"
-
-    # None means the server is unreachable, distinct from "no reading yet".
-    characteristic.update_latency(None)
-
-    assert bytes(characteristic.Value).decode("utf-8") == "LATENCY -"
 
 
 def test_robot_control_characteristic_dispatches_commands():
@@ -577,7 +434,7 @@ def test_wifi_config_characteristic_relays_immediate_errors():
 
 
 def test_dbus_signatures_match_bluez_gatt_contract():
-    characteristic_xml = CommandCharacteristic.__dbus_xml__
+    characteristic_xml = RobotControlCharacteristic.__dbus_xml__
     application_xml = GattApplication.__dbus_xml__
 
     assert 'method name="WriteValue"' in characteristic_xml
@@ -585,13 +442,10 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert 'method name="GetManagedObjects"' in application_xml
     assert 'type="a{oa{sa{sv}}}"' in application_xml
     managed_objects = GattApplication().GetManagedObjects()
-    assert URL_CHAR_UUID in str(managed_objects)
-    assert ERROR_CHAR_UUID in str(managed_objects)
     assert BATTERY_STATUS_CHAR_UUID in str(managed_objects)
     assert NETWORK_CHAR_UUID in str(managed_objects)
     assert CPU_CHAR_UUID in str(managed_objects)
     assert BANDWIDTH_CHAR_UUID in str(managed_objects)
-    assert LATENCY_CHAR_UUID in str(managed_objects)
     assert ROBOT_CONTROL_CHAR_UUID in str(managed_objects)
     assert WIFI_CONFIG_CHAR_UUID in str(managed_objects)
     assert ZONE_NAV_CHAR_UUID in str(managed_objects)
@@ -599,57 +453,58 @@ def test_dbus_signatures_match_bluez_gatt_contract():
     assert MEMORY_CHAR_UUID in str(managed_objects)
     assert ZONE_VOICE_CHAR_UUID in str(managed_objects)
     assert INITIAL_POSE_CHAR_UUID in str(managed_objects)
-    command_cccd = _unpack_properties(
-        managed_objects[CHARACTERISTIC_CCCD_PATH]["org.bluez.GattDescriptor1"]
+    assert LAN_ENDPOINT_CHAR_UUID in str(managed_objects)
+    assert AUDIO_ENDPOINT_CHAR_UUID in str(managed_objects)
+    assert "abcdef1" not in str(managed_objects)
+    assert "abcdef2" not in str(managed_objects)
+    assert "abcdef3" not in str(managed_objects)
+    assert "abcdef8" not in str(managed_objects)
+    battery_cccd = _unpack_properties(
+        managed_objects[BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH][
+            "org.bluez.GattDescriptor1"
+        ]
     )
-    assert command_cccd == {
+    assert battery_cccd == {
         "UUID": CCCD_UUID,
-        "Characteristic": "/org/xiaozhi/ble_app/service0/char0",
+        "Characteristic": "/org/xiaozhi/ble_app/service0/char3",
         "Flags": ["read", "write"],
     }
-    assert URL_CHARACTERISTIC_CCCD_PATH in managed_objects
-    assert ERROR_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert BATTERY_STATUS_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert NETWORK_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert CPU_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert BANDWIDTH_CHARACTERISTIC_CCCD_PATH in managed_objects
-    assert LATENCY_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ROBOT_CONTROL_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert WIFI_CONFIG_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ZONE_NAV_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert MEMORY_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert ZONE_VOICE_CHARACTERISTIC_CCCD_PATH in managed_objects
     assert INITIAL_POSE_CHARACTERISTIC_CCCD_PATH in managed_objects
-    command_char = _unpack_properties(
-        managed_objects["/org/xiaozhi/ble_app/service0/char0"][
+    lan_char = _unpack_properties(
+        managed_objects[LAN_ENDPOINT_CHARACTERISTIC_PATH][
             "org.bluez.GattCharacteristic1"
         ]
     )
-    assert command_char["Descriptors"] == [CHARACTERISTIC_CCCD_PATH]
+    assert lan_char["Flags"] == ["read"]
+    assert lan_char["Descriptors"] == []
+    audio_char = _unpack_properties(
+        managed_objects[AUDIO_ENDPOINT_CHARACTERISTIC_PATH][
+            "org.bluez.GattCharacteristic1"
+        ]
+    )
+    assert audio_char["Flags"] == ["read"]
+    assert audio_char["Descriptors"] == []
 
 
 def test_notify_tolerates_properties_changed_failure(monkeypatch):
     def fail_emit(*args):
         raise RuntimeError("D-Bus connection is gone")
 
-    monkeypatch.setattr(CommandCharacteristic, "PropertiesChanged", fail_emit)
-    characteristic = CommandCharacteristic(_ok_callback([]))
+    monkeypatch.setattr(BatteryStatusCharacteristic, "PropertiesChanged", fail_emit)
+    characteristic = BatteryStatusCharacteristic()
     characteristic.StartNotify()
+    characteristic.update_status(0.67, "CHARGING")
 
-    assert _value(characteristic) == "STATE idle"
-
-    characteristic.update_state("listening")
-
-    assert _value(characteristic) == "STATE listening"
-
-    monkeypatch.setattr(ErrorCharacteristic, "PropertiesChanged", fail_emit)
-    error_characteristic = ErrorCharacteristic()
-    error_characteristic.StartNotify()
-    error_characteristic.publish("WS_ERROR", "connection failed")
-
-    assert bytes(error_characteristic.Value).decode("utf-8") == (
-        "ERROR WS_ERROR connection failed"
-    )
+    assert bytes(characteristic.Value).decode("utf-8") == "0.670 CHARGING"
 
 
 def test_advertisement_release_triggers_recovery_callback():
@@ -668,7 +523,7 @@ def test_advertisement_release_triggers_recovery_callback():
 
 
 def test_bluez_vanish_marks_server_unregistered():
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._registered = True
     server._gatt_registered = True
     server._advertisement_registered = True
@@ -690,21 +545,6 @@ def test_bluez_vanish_marks_server_unregistered():
     assert server._advertisement_registered is True
 
 
-def test_stop_notify_invokes_disconnect_hook():
-    calls = []
-    characteristic = CommandCharacteristic(
-        _ok_callback([]),
-        on_disconnect=lambda: calls.append(True),
-    )
-    characteristic.StartNotify()
-
-    assert calls == []
-
-    characteristic.StopNotify()
-
-    assert calls == [True]
-
-
 def test_refresh_advertisement_restarts_registered_advertisement():
     class _Manager:
         def __init__(self) -> None:
@@ -719,7 +559,7 @@ def test_refresh_advertisement_restarts_registered_advertisement():
             self.registered.append(path)
             callback(lambda: None)
 
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._gatt_registered = True
     server._advertisement_registered = True
     server._advertising_manager = _Manager()
@@ -741,7 +581,7 @@ def test_refresh_advertisement_registers_when_not_active():
             self.registered.append(path)
             callback(lambda: None)
 
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._gatt_registered = True
     server._advertising_manager = _Manager()
 
@@ -752,7 +592,7 @@ def test_refresh_advertisement_registers_when_not_active():
 
 
 def test_refresh_advertisement_skipped_during_shutdown():
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._gatt_registered = True
     server._advertisement_registered = True
     server._shutdown_requested = True
@@ -767,7 +607,7 @@ def test_refresh_advertisement_ignores_release_during_unregister(monkeypatch):
         lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
     )
 
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._gatt_registered = True
     server._advertisement_registered = True
 
@@ -804,7 +644,7 @@ def test_client_disconnected_schedules_single_refresh(monkeypatch):
         "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
         lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
     )
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._gatt_registered = True
 
     server._on_client_disconnected()
@@ -823,7 +663,7 @@ def test_client_disconnected_skipped_when_unregistered_or_shutting_down(
         "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
         lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
     )
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
 
     server._on_client_disconnected()
     assert scheduled == []
@@ -841,7 +681,7 @@ def test_unexpected_advertisement_release_schedules_reregister(monkeypatch):
         "xiaozhi_ble.gatt_server.GLib.timeout_add_seconds",
         lambda seconds, callback: scheduled.append((seconds, callback)) or 0,
     )
-    server = BleControlServer(_ok_callback([]))
+    server = BleControlServer()
     server._advertisement_registered = True
 
     server._on_advertisement_released()

@@ -1,0 +1,21 @@
+[Unit]
+Description=Xiaozhi PCM TCP playback server
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sunrise
+Group=sunrise
+WorkingDirectory=/home/sunrise
+Environment=HOME=/home/sunrise
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PYTHONUNBUFFERED=1
+# 移动脚本后改这里的路径。默认 PCM :4203、查询口 :4204。
+# 需要固定声卡时在末尾加 -d <index>（python3 pcm_tcp_server.py --list 查看）。
+ExecStart=/usr/bin/python3 /home/sunrise/pcm_tcp_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

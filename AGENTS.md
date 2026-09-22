@@ -4,8 +4,9 @@
 （人或 AI）遵守。项目功能介绍见 [README.md](README.md)，BLE 协议定义见
 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)，本文不重复这些内容。
 
-项目一句话：小智机器人的 BLE 控制桥接进程，向上（手机 App）暴露 BlueZ GATT
-服务，向下对接对话模块的 Unix 控制 socket 和本机状态（ROS2 话题、内核接口）。
+项目一句话：小智机器人的 BLE / 局域网控制桥接进程，向上（手机 App）暴露
+BlueZ GATT 服务和 TCP 控制口，向下对接本机状态（ROS2 话题、内核接口、
+pcm_tcp_server 查询口）。
 
 ## 1. 避免"执行命令 + 解析输出"
 
@@ -34,11 +35,11 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
 
 ## 2. Provider 模式（数据采集模块）
 
-`network.py` / `cpu.py` / `memory.py` / `bandwidth.py` / `latency.py` / `zone_voice.py` 遵循同一套模式，新增
+`network.py` / `cpu.py` / `memory.py` / `bandwidth.py` / `audio_endpoint.py` / `zone_voice.py` / `lan_server.py` 遵循同一套模式，新增
 数据源时请照抄：
 
 - 独立线程 + `threading.Event` 停止信号；`start()` 幂等、`stop(timeout)` 可join。
-  例外：ROS 相关模块（`battery.py` 订阅、`robot_control.py` 服务调用、
+  例外：ROS 相关模块（`battery.py` 订阅、`robot_control.py` 服务调用与话题发布、
   `zone_nav.py` 发布）不自带线程，`start(node)` 挂载到共享 runtime 节点上，
   由 runtime 的 spin 线程驱动。
 - **优雅降级**：依赖缺失时（rclpy 不可导入、没有无线网卡、`/proc` 文件不存在）
@@ -61,9 +62,16 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
   以及 `_run()` 里的创建/CCCD/发布。
   **尾号已用尽**：`abcdef0`–`abcdeff` 均已占用（Zone Voice 为 `abcdeff` /
   `char14`）。再新增特征值必须换 UUID 方案：已启用
-  `12345678-1234-5678-1234-56789abcdNNN` 系列（首个为 Initial Pose 的
-  `...56789abcd010` / `char15`），后续按 `abcd011`、`abcd012` 递增，对象路径
-  继续从 `char16` 往下排；不要把 UUID 最后一组扩成 13 个十六进制字符。
+  `12345678-1234-5678-1234-56789abcdNNN` 系列（Initial Pose 为
+  `...56789abcd010` / `char15`，LAN Endpoint `abcd011` / `char16`，
+  Audio Endpoint `abcd012` / `char17`），后续按 `abcd013` 递增，对象路径
+  继续从 `char18` 往下排；不要把 UUID 最后一组扩成 13 个十六进制字符。
+- **新特征值默认不要 Notify。** Android 15 起一条 BLE 连接大约只能订阅 15 路
+  CCCD；本服务当前占用 12 路 Notify（Battery、Network、CPU、Bandwidth、
+  Robot Control、WiFi Config、Nav Task、Zone Nav、Cmd Vel、Memory、
+  Zone Voice、Initial Pose），余量 3。只有「连接期间会变、且 App 不能靠
+  已有 Notify / 主动 Read 拿到」才加 Notify。LAN Endpoint 与 Audio Endpoint
+  因此是只读、无 CCCD。
 - BLE 对 App 保持纯文本；下游本机协议可以是 JSON Lines（如
   `zone_voice.py` 对接 `zone_voice_player`），翻译发生在桥接模块内部，
   不得把 JSON 包装泄漏到 GATT 特征值。
@@ -79,6 +87,8 @@ SIGINT 优雅停止（超时 SIGKILL）、输出落日志文件只用于排查�
   模型、共享 rclpy 节点、配置文件路径、日志文件、内部模块行为等）；需要描述
   机器人行为时只写对外可见的语义（如"停止写入后机器人会自动停车"），实现
   说明放 README.md 或本文档。
+- `LAN_CONTROL_PROTOCOL.md`：局域网 TCP 控制通道的 App 可见契约（通道名、
+  行格式、与 BLE payload 的对应关系）。
 - `README.md`：架构清单、功能小节、部署/依赖说明。
 - `config.yaml.example`：新增配置项必须带注释示例。
 - `AGENTS.md`（本文）：新形成的规范或经验。

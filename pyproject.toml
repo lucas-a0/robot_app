@@ -1,7 +1,7 @@
 [project]
 name = "xiaozhi-ble"
 version = "0.1.0"
-description = "BLE push-to-talk control bridge for the xiaozhi voice client"
+description = "BLE and LAN TCP control bridge for the xiaozhi robot"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

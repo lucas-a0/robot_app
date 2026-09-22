@@ -1,16 +1,12 @@
-# 小智 BLE 控制桥接配置示例
+# 小智 BLE / LAN 控制桥接配置示例
 # 复制为 ~/.config/xiaozhi-ble/config.yaml 后按需修改
-
-# 对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket 路径，
-# 必须与对话模块配置中的 control.socket_path 一致。
-control_socket_path: /tmp/xiaozhi-control.sock
 
 # BLE 广播与 BlueZ 适配器
 bluetooth:
   adapter: /org/bluez/hci0      # BlueZ 适配器 D-Bus 路径，通常第一个适配器为 hci0
   name: Xiaozhi                 # BLE 广播名称；App 应优先按 Service UUID 筛选
 
-# 电量获取（本模块自己订阅，不经过对话模块）
+# 电量获取（本模块自己订阅）
 # 通过内置的 rclpy 节点订阅 sensor_msgs/BatteryState 话题，
 # 上报 percentage（电量百分比）和 power_supply_status（充电状态）。
 # 需要进程带有 ROS2 环境（如 service 中 source /opt/ros/humble/setup.bash）；
@@ -47,24 +43,35 @@ bandwidth:
   poll_interval_secs: 5         # 轮询周期（秒）
   notify_threshold: 10.0        # rx 或 tx 变化达到多少 KB/s 才通知 App
 
-# 对话服务器延迟上报：对从控制 socket 同步到的 WebSocket 地址主机做 TCP 建连，
-# 以建连耗时近似 ping 延迟。尚未同步到地址时探测挂起，App 侧显示 UNKNOWN。
-latency:
-  poll_interval_secs: 5         # 探测周期（秒）
-  notify_threshold_ms: 10.0     # 延迟变化达到多少毫秒才通知 App
-  connect_timeout_secs: 2.0     # 单次建连超时（秒）
+# 局域网 TCP 控制通道（BLE 的全功能兜底，协议见 LAN_CONTROL_PROTOCOL.md）。
+# App 先通过 BLE 读取 LAN Endpoint 拿到本机 IPv4 和该端口，再连过来。
+lan:
+  host: 0.0.0.0                 # 监听地址
+  port: 4205                    # 控制口（默认 4205）
 
-# 机器人行为控制：App 向 Robot Control 特征值写入命令名，本模块通过共享的
-# rclpy 节点（与 battery 同一个）异步调用对应的 std_srvs/Trigger 服务。
-# 服务类型固定为 Trigger（空请求、success/message 响应），映射只需写服务名。
+# PCM 播放服务查询：周期连接 pcm_tcp_server 的查询口（默认 127.0.0.1:4204），
+# 读取一行 AUDIO <port> <rate> <channels>，再与当前 WiFi IPv4 拼成音频下发地址。
+# 查询失败时 Audio Endpoint 为 UNKNOWN，不猜测端口。
+audio:
+  query_host: 127.0.0.1
+  query_port: 4204
+  poll_interval_secs: 5
+
+# 机器人行为控制：App 向 Robot Control 特征值写入命令名。
+# 姿态命令（stand_up / squat / lie_down）按 commands 映射异步调用
+# std_srvs/Trigger 服务；运动命令（go_forward / go_back / turn_left /
+# turn_right / dance / nod）作为 std_msgs/String 发布到 topic
+# （默认 /xiaozhi_topic，与旧语音客户端相同）。topic 留空则禁用运动命令。
 # 成功完全静默；失败（命令不存在、服务不在线、success=false、超时）通过
 # 特征值 Notify 上报。需要 ROS2 环境（同 battery）；不可用时写入会收到
-# ERR unavailable。commands 留空或删除则禁用该功能。
+# ERR unavailable。commands 与 topic 都空则禁用该功能。
 robot_control:
   call_timeout_secs: 10.0       # 单次服务调用超时（秒），超时按失败上报
+  topic: /xiaozhi_topic         # 运动命令话题（std_msgs/String）；留空禁用
   commands:                     # BLE 命令名 -> ROS2 服务名
     stand_up: /base_bridge/stand_up
     lie_down: /base_bridge/lie_down
+    squat: /base_bridge/lie_down
 
 # WiFi 配网：App 向 WiFi Config 特征值写入 "<ssid>\n<password>"，本模块通过
 # NetworkManager D-Bus 接口（dasbus，无子进程调用）创建并激活 WiFi 连接，

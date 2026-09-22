@@ -1,14 +1,9 @@
-"""Entry point for the xiaozhi BLE control bridge.
+"""Entry point for the xiaozhi BLE / LAN control bridge.
 
-The bridge owns the BlueZ GATT service and translates between the BLE
-protocol (see BLE_CONTROL_PROTOCOL.md) and the voice client's Unix socket
-control protocol:
-
-- App start/stop writes        -> "start"/"stop" requests
-- App URL writes               -> "set_url <url>" requests
-- Control socket (re)connect   -> "get_url" request to sync the URL characteristic
-- STATE/URL/ERROR push        -> GATT characteristic notifications
-- BLE disconnect while pressed -> automatic "stop" request
+The bridge owns the BlueZ GATT service and a LAN TCP control server
+(see BLE_CONTROL_PROTOCOL.md and LAN_CONTROL_PROTOCOL.md). Both
+transports dispatch into the same providers; notifications are fanned
+out to whichever transport is connected.
 """
 
 from __future__ import annotations
@@ -20,15 +15,15 @@ import threading
 
 from loguru import logger
 
+from .audio_endpoint import AudioEndpointProvider, format_endpoint
 from .battery import BatteryProvider
 from .bandwidth import BandwidthProvider
 from .cmd_vel import CmdVelPublisher
 from .config import BridgeConfig
-from .control_client import ControlClient, ControlRequestError, ControlUnavailable
 from .cpu import CpuProvider
-from .gatt_server import BleControlServer, BridgeError
+from .gatt_server import BleControlServer
 from .initial_pose import InitialPosePublisher
-from .latency import LatencyProvider
+from .lan_server import LanControlServer
 from .memory import MemoryProvider
 from .nav_tasks import NavTaskManager
 from .network import NetworkProvider
@@ -40,10 +35,12 @@ from .zone_voice import ZoneVoiceController
 
 
 class _Bridge:
-    """Wire the control-socket client to the BLE GATT server."""
+    """Wire providers to the BLE GATT server and the LAN TCP server."""
 
     def __init__(self, config: BridgeConfig) -> None:
-        self._client: ControlClient | None = None
+        self._lan_port = config.lan_port
+        self._ipv4: str | None = None
+        self._audio_port: int | None = None
         # Navigation launch tasks: two fixed ros2 launch commands run as
         # managed child processes (see nav_tasks.py); task templates are
         # hardcoded, asynchronous events come back through notify_nav_task.
@@ -71,13 +68,8 @@ class _Bridge:
             poll_interval_secs=config.zone_voice_poll_interval_secs,
         )
         self._server = BleControlServer(
-            callback=self._handle_command,
-            url_callback=self._handle_url_update,
             adapter_path=config.bluetooth_adapter,
             device_name=config.bluetooth_name,
-            initial_state="idle",
-            initial_url="",
-            initial_error=("VOICE_UNAVAILABLE", "control socket is not connected"),
             initial_battery_status=(None, None),
             robot_control_callback=self._handle_robot_command,
             wifi_config_callback=self._handle_wifi_config,
@@ -87,10 +79,16 @@ class _Bridge:
             zone_voice_callback=self._zone_voice.execute,
             initial_pose_callback=self._initial_pose.execute,
         )
-        self._client = ControlClient(
-            socket_path=config.control_socket_path,
-            on_notification=self._handle_notification,
-            on_connection_change=self._handle_connection_change,
+        self._lan = LanControlServer(
+            host=config.lan_host,
+            port=config.lan_port,
+            robot_control_callback=self._handle_robot_command,
+            wifi_config_callback=self._handle_wifi_config,
+            nav_task_callback=self._nav_tasks.execute,
+            zone_nav_callback=self._zone_nav.execute,
+            cmd_vel_callback=self._cmd_vel.execute,
+            zone_voice_callback=self._zone_voice.execute,
+            initial_pose_callback=self._initial_pose.execute,
         )
         # Battery, robot control, zone navigation and velocity control share
         # one rclpy node owned by the ROS runtime (rclpy init/shutdown are
@@ -99,50 +97,44 @@ class _Bridge:
         self._ros_runtime = RosRuntime()
         self._battery_provider = BatteryProvider(
             topic=config.battery_topic,
-            on_status=self._server.notify_battery_status,
+            on_status=self._on_battery,
         )
         # Robot control is also bridge-local: BLE command names map to
-        # std_srvs/Trigger services from configuration; success stays
-        # silent, failures come back through notify_robot_control_error.
+        # std_srvs/Trigger services and/or a std_msgs/String topic from
+        # configuration; success stays silent, failures come back through
+        # notify_robot_control_error.
         self._robot_control = RobotControl(
             commands=config.robot_control_commands,
             call_timeout_secs=config.robot_control_call_timeout_secs,
-            on_error=self._server.notify_robot_control_error,
+            on_error=self._on_robot_control_error,
+            topic=config.robot_control_topic,
         )
         # Network status is also bridge-local: read the WiFi link from the
         # kernel (ioctl + /proc/net/wireless + netifaces), no subprocesses.
         self._network_provider = NetworkProvider(
             interface=config.network_interface,
             poll_interval_secs=config.network_poll_interval_secs,
-            on_status=self._server.notify_network_status,
+            on_status=self._on_network,
         )
         # CPU usage likewise: sample /proc/stat and report the delta.
         self._cpu_provider = CpuProvider(
-            on_usage=self._server.notify_cpu_usage,
+            on_usage=self._on_cpu,
             poll_interval_secs=config.cpu_poll_interval_secs,
             notify_threshold=config.cpu_notify_threshold,
         )
         # Memory occupancy: read /proc/meminfo (instantaneous used/total).
         self._memory_provider = MemoryProvider(
-            on_usage=self._server.notify_memory_usage,
+            on_usage=self._on_memory,
             poll_interval_secs=config.memory_poll_interval_secs,
             notify_threshold=config.memory_notify_threshold,
         )
         # WiFi throughput: /proc/net/dev byte-counter deltas on the same
         # interface as the network provider.
         self._bandwidth_provider = BandwidthProvider(
-            on_bandwidth=self._server.notify_bandwidth,
+            on_bandwidth=self._on_bandwidth,
             interface=config.network_interface,
             poll_interval_secs=config.bandwidth_poll_interval_secs,
             notify_threshold=config.bandwidth_notify_threshold,
-        )
-        # Dialogue-server latency: TCP connect time against the effective
-        # WebSocket URL pushed from the control socket (see _publish_url).
-        self._latency_provider = LatencyProvider(
-            on_latency=self._server.notify_latency,
-            poll_interval_secs=config.latency_poll_interval_secs,
-            notify_threshold_ms=config.latency_notify_threshold_ms,
-            connect_timeout_secs=config.latency_connect_timeout_secs,
         )
         # WiFi provisioning: NetworkManager over D-Bus (dasbus, no
         # subprocesses), one attempt at a time; the result comes back
@@ -151,10 +143,14 @@ class _Bridge:
             on_result=self._publish_wifi_result,
             connect_timeout_secs=config.wifi_connect_timeout_secs,
         )
+        self._audio_endpoint_provider = AudioEndpointProvider(
+            on_port=self._on_audio_port,
+            query_host=config.audio_query_host,
+            query_port=config.audio_query_port,
+            poll_interval_secs=config.audio_poll_interval_secs,
+        )
 
     def start(self) -> bool:
-        assert self._client is not None
-        self._client.start()
         # The shared rclpy node only comes up when a ROS-backed feature is
         # configured; without a ROS2 environment they all stay disabled.
         if (
@@ -175,19 +171,17 @@ class _Bridge:
         self._cpu_provider.start()
         self._memory_provider.start()
         self._bandwidth_provider.start()
-        self._latency_provider.start()
+        self._audio_endpoint_provider.start()
         self._zone_voice.start()
+        lan_ok = self._lan.start()
+        if not lan_ok:
+            logger.error("Failed to start LAN control server")
         if self._server.start():
-            # The client may have connected before the GATT server was up, in
-            # which case the "connected" callback was dropped; sync the error
-            # characteristic with the actual connection state now.
-            if self._client.connected:
-                self._server.notify_error("NONE", "")
-                self._sync_websocket_url()
             return True
         logger.error(f"Failed to start BLE control: {self._server.error}")
+        self._lan.stop()
         self._zone_voice.stop()
-        self._latency_provider.stop()
+        self._audio_endpoint_provider.stop()
         self._bandwidth_provider.stop()
         self._memory_provider.stop()
         self._cpu_provider.stop()
@@ -198,19 +192,18 @@ class _Bridge:
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
-        self._client.stop()
         return False
 
     def stop(self) -> None:
-        assert self._client is not None
-        # Stop the GATT server first: its shutdown releases an outstanding
-        # push-to-talk press, which needs the client to still be up.
+        # Stop the GATT server first so BlueZ unregisters while the rest of
+        # the bridge is still up for any in-flight command.
         self._server.stop()
+        self._lan.stop()
         # Then stop any running navigation launch tasks (SIGINT the process
         # groups, SIGKILL whatever ignores it).
         self._nav_tasks.stop_all()
         self._zone_voice.stop()
-        self._latency_provider.stop()
+        self._audio_endpoint_provider.stop()
         self._bandwidth_provider.stop()
         self._memory_provider.stop()
         self._cpu_provider.stop()
@@ -223,11 +216,58 @@ class _Bridge:
         self._robot_control.stop()
         self._battery_provider.stop()
         self._ros_runtime.stop()
-        self._client.stop()
+
+    def _on_battery(self, percentage: float | None, supply_status: str | None) -> None:
+        self._server.notify_battery_status(percentage, supply_status)
+        self._lan.notify_battery_status(percentage, supply_status)
+
+    def _on_network(
+        self,
+        ssid: str | None,
+        rssi_dbm: int | None,
+        ipv4: str | None,
+    ) -> None:
+        self._ipv4 = ipv4
+        self._server.notify_network_status(ssid, rssi_dbm, ipv4)
+        self._lan.notify_network_status(ssid, rssi_dbm, ipv4)
+        self._publish_endpoints()
+
+    def _on_cpu(self, usage: float | None) -> None:
+        self._server.notify_cpu_usage(usage)
+        self._lan.notify_cpu_usage(usage)
+
+    def _on_memory(
+        self,
+        used_mb: int,
+        total_mb: int,
+        percent: float,
+    ) -> None:
+        self._server.notify_memory_usage(used_mb, total_mb, percent)
+        self._lan.notify_memory_usage(used_mb, total_mb, percent)
+
+    def _on_bandwidth(self, rx_kbps: float, tx_kbps: float) -> None:
+        self._server.notify_bandwidth(rx_kbps, tx_kbps)
+        self._lan.notify_bandwidth(rx_kbps, tx_kbps)
+
+    def _on_audio_port(self, port: int | None) -> None:
+        self._audio_port = port
+        self._publish_endpoints()
+
+    def _publish_endpoints(self) -> None:
+        lan_text = format_endpoint(self._ipv4, self._lan_port)
+        audio_text = format_endpoint(self._ipv4, self._audio_port)
+        self._server.update_lan_endpoint(lan_text)
+        self._server.update_audio_endpoint(audio_text)
+        self._lan.set_lan_endpoint(lan_text)
+        self._lan.set_audio_endpoint(audio_text)
 
     def _handle_robot_command(self, command: str) -> str | None:
         """Dispatch a robot-control command; an error text is relayed to the App."""
         return self._robot_control.execute(command)
+
+    def _on_robot_control_error(self, text: str) -> None:
+        self._server.notify_robot_control_error(text)
+        self._lan.notify_robot_control_error(text)
 
     def _handle_wifi_config(self, ssid: str, password: str) -> str | None:
         """Dispatch a WiFi provisioning request; an error text is relayed to the App."""
@@ -237,99 +277,25 @@ class _Bridge:
     def _forward_nav_task_event(self, text: str) -> None:
         """Relay an asynchronous nav-task event (STOPPED/EXITED) to the App."""
         self._server.notify_nav_task(text)
+        self._lan.notify_nav_task(text)
 
     def _forward_zone_voice_event(self, text: str) -> None:
         """Relay a zone-voice status change (PLAYING/IDLE/UNKNOWN) to the App."""
         self._server.notify_zone_voice(text)
+        self._lan.notify_zone_voice(text)
 
     def _publish_wifi_result(self, code: str, ssid: str) -> None:
         """Relay the asynchronous provisioning outcome to the App."""
         if code == "connected":
-            self._server.notify_wifi_config_result(f"CONNECTED {ssid}")
+            text = f"CONNECTED {ssid}"
         else:
-            self._server.notify_wifi_config_result(f"FAILED {code} {ssid}")
-
-    def _handle_command(self, command: str, reason: str) -> str:
-        """Forward a start/stop command; the return value is relayed to the App."""
-        assert self._client is not None
-        try:
-            return self._client.request(command)
-        except ControlRequestError as exc:
-            return f"ERR {exc.code} {exc.message}"
-        except ControlUnavailable as exc:
-            return f"ERR VOICE_UNAVAILABLE {exc}"
-
-    def _handle_url_update(self, url: str) -> None:
-        assert self._client is not None
-        try:
-            self._client.request(f"set_url {url}")
-        except ControlRequestError as exc:
-            raise BridgeError(exc.code, exc.message) from exc
-        except ControlUnavailable as exc:
-            raise BridgeError("VOICE_UNAVAILABLE", str(exc)) from exc
-
-    def _handle_notification(self, line: str) -> None:
-        if line.startswith("STATE "):
-            self._server.notify_state(line[len("STATE "):])
-        elif line.startswith("URL "):
-            self._publish_websocket_url(line[len("URL "):])
-        elif line == "NONE":
-            self._server.notify_error("NONE", "")
-        elif line.startswith("ERROR "):
-            parts = line.split(" ", 2)
-            code = parts[1]
-            message = parts[2] if len(parts) > 2 else ""
-            self._server.notify_error(code, message)
-        else:
-            logger.warning(f"Unknown control notification: {line!r}")
-
-    def _handle_connection_change(self, connected: bool) -> None:
-        if connected:
-            # Clear the initial/reconnect VOICE_UNAVAILABLE error once the
-            # control socket is reachable again.
-            self._server.notify_error("NONE", "")
-            # This callback fires on the client's reader thread, which is
-            # also responsible for dispatching request responses; a blocking
-            # request() here would time out, so sync from a worker thread.
-            threading.Thread(
-                target=self._sync_websocket_url,
-                name="xiaozhi-url-sync",
-                daemon=True,
-            ).start()
-        else:
-            self._server.notify_error(
-                "VOICE_UNAVAILABLE",
-                "control socket is not connected",
-            )
-
-    def _publish_websocket_url(self, url: str) -> None:
-        """Publish the effective URL over BLE and retarget the latency probe."""
-        self._server.notify_websocket_url(url)
-        self._latency_provider.set_url(url)
-
-    def _sync_websocket_url(self) -> None:
-        """Query the effective WebSocket URL and publish it over BLE.
-
-        The URL push on the control socket only fires when the address
-        changes, and any snapshot sent before the GATT server is up is
-        dropped, so the bridge must ask for the current value explicitly
-        on (re)connect. Without this the App sees an empty URL.
-        """
-        assert self._client is not None
-        try:
-            response = self._client.request("get_url")
-        except (ControlRequestError, ControlUnavailable) as exc:
-            logger.warning(f"Could not query websocket URL: {exc}")
-            return
-        parts = response.split(" ", 2)
-        if len(parts) == 3 and parts[1] == "url" and parts[2]:
-            self._publish_websocket_url(parts[2])
-        else:
-            logger.warning(f"Unexpected get_url response: {response!r}")
+            text = f"FAILED {code} {ssid}"
+        self._server.notify_wifi_config_result(text)
+        self._lan.notify_wifi_config_result(text)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="xiaozhi BLE control bridge")
+    parser = argparse.ArgumentParser(description="xiaozhi BLE/LAN control bridge")
     parser.add_argument(
         "--config",
         default=str(BridgeConfig.default_path()),

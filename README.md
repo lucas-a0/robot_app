@@ -1,28 +1,35 @@
 # xiaozhi-ble
 
-小智语音客户端的 BLE 控制桥接模块，独立进程运行。
+小智机器人的 BLE / 局域网控制桥接模块，独立进程运行。
 
-手机 App 通过 BLE GATT 实现"按住说话"（协议见 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)），
-本模块把 BLE 控制指令转发给对话模块（xiaozhi ROS2 节点）暴露的 Unix 控制 socket，
-把对话模块推送的状态/错误/服务器地址以及本机的电池状态/网络状态/CPU/内存占用回传给 App，
-并通过 ROS2 服务调用执行 App 下发的机器人行为命令（如站立、蹲下），
-以及启停两个固定的导航 launch 任务（定位 bringup 与 Nav2 导航）、
-向 `/xiaozhi_topic` 发布四个固定区域的导航目标、
-通过 Unix socket 控制区域语音播放器列出/播放/停止提示音。
+手机 App 先通过 BLE GATT 连接（协议见 [BLE_CONTROL_PROTOCOL.md](BLE_CONTROL_PROTOCOL.md)），
+读取 LAN Endpoint 得到本机 IPv4 和控制口（默认 4205），蓝牙断开后改走
+局域网 TCP（协议见 [LAN_CONTROL_PROTOCOL.md](LAN_CONTROL_PROTOCOL.md)）。
+两条通道功能相同：电池/网络/CPU/内存/带宽回传、机器人行为、WiFi 配网、
+导航任务、区域导航、速度控制、区域提示音、初始位姿。
+
+语音对话由 App 完成。App 再 Read Audio Endpoint（或 TCP `GET AUDIO`）得到
+PCM 播放地址（默认 4203），把裸 PCM 打到本机的 `pcm_tcp_server`。
 
 ```text
-手机 App  <-- BLE GATT -->  xiaozhi-ble（本模块）  <-- Unix socket -->  xiaozhi 对话模块
+手机 App  <-- BLE GATT -->  xiaozhi-ble（本模块）
+     |                          ^
+     +----- TCP :4205 ----------+   蓝牙断开后的全功能兜底
+     +----- TCP :4203 --> pcm_tcp_server  仅音频 PCM
 ```
 
 ## 架构
 
 - `gatt_server.py`：BlueZ GATT 外设（GLib 事件循环线程），实现 App 侧协议。
   客户端断开后会延迟几秒主动重新注册广播，兜底部分适配器断连后不再
-  恢复广播、导致重新扫描不到设备的问题。该自愈依赖 App 已订阅 Command
-  特征值的 Notify（BlueZ 在取消订阅或断连时调用 `StopNotify`）；未订阅
-  则不会触发。刷新是盲式注销再注册，BlueZ 自己已恢复时也只会造成短暂
+  恢复广播、导致重新扫描不到设备的问题。该自愈挂在所有仍带 Notify 的
+  特征值的 `StopNotify` 上（BlueZ 在取消订阅或断连时调用）；未订阅任何
+  Notify 则不会触发。刷新是盲式注销再注册，BlueZ 自己已恢复时也只会造成短暂
   广播空窗。
-- `control_client.py`：Unix socket 客户端，自动重连，请求/响应匹配。
+- `lan_server.py`：局域网 TCP 控制服务（默认 `0.0.0.0:4205`），行文本协议，
+  单客户端，与 GATT 共用同一套业务 callback。
+- `audio_endpoint.py`：查询本机 `pcm_tcp_server` 的查询口（默认 127.0.0.1:4204），
+  得到 PCM 播放端口，再与 WiFi IPv4 拼成 Audio Endpoint。
 - `battery.py`：电池状态获取，在共享 rclpy 节点上订阅
   `sensor_msgs/BatteryState` 话题（默认 `/battery_state`），上报电量百分比和
   充电状态；ROS2 环境不可用时自动禁用，不影响其余功能。
@@ -30,7 +37,8 @@
   节点（`xiaozhi_ble`）和 spin 线程；battery、robot_control、zone_nav、
   cmd_vel 和 initial_pose 都挂载在这个节点上，不各自创建上下文。
 - `robot_control.py`：机器人行为控制，把 App 写入的命令名按配置映射为
-  `std_srvs/Trigger` 服务并异步调用；成功静默，失败通过特征值 Notify 上报。
+  `std_srvs/Trigger` 服务（站起 / 蹲下）或发布到 `/xiaozhi_topic`
+  （前进 / 后退 / 转向 / 跳舞 / 点头）；成功静默，失败通过特征值 Notify 上报。
 - `network.py`：网络状态获取，直接从内核读取 WiFi 状态（SSID 用 wireless
   extensions ioctl，信号强度读 `/proc/net/wireless`，IPv4 地址用 netifaces 库），
   仅在状态变化时通知；没有无线网卡时自动禁用。
@@ -41,9 +49,6 @@
 - `bandwidth.py`：WiFi 带宽速率获取，周期读取 `/proc/net/dev` 的累计字节
   计数并计算差分（rx/tx 各多少 KB/s），变化超过阈值才通知；没有无线网卡时
   自动禁用。
-- `latency.py`：对话服务器延迟探测，按周期向 WebSocket 地址的主机发起
-  TCP 建连，以建连耗时近似 ping 延迟（无需 root 的 ICMP raw socket）；
-  服务器地址由控制 socket 同步推送，地址不可用时探测自动挂起。
 - `wifi_config.py`：WiFi 配网，把 App 写入的 SSID/密码通过 NetworkManager
   D-Bus 接口创建并激活连接（固定连接名 `xiaozhi-ble`），结果异步回调上报；
   NetworkManager 或无线网卡不可用时自动降级。
@@ -65,29 +70,12 @@
   zone_voice_player 的 JSON Lines Unix socket 请求；按周期查询播放状态，
   仅变化时 Notify（含机器人自行触发的播放与自然结束）。播放器未运行时
   自动降级。
-- `main.py`：桥接装配（命令转发、通知分发、断连兜底）。
+- `main.py`：桥接装配（GATT 与 LAN 双通道扇出、命令转发）。
 - `config.py`：YAML 配置加载。
-
-### 控制 socket 协议（对话模块侧实现）
-
-行文本协议。请求一行一条，响应以 `OK`/`ERR` 开头，其余为推送通知：
-
-| 方向 | 内容 | 说明 |
-|------|------|------|
-| 请求 | `start` / `stop` | 开始/结束收音，响应 `OK start` / `OK stop` 或 `ERR <code> <msg>` |
-| 请求 | `get_url` | 查询当前 WebSocket 地址，响应 `OK url <url>` |
-| 请求 | `set_url <url>` | 修改 WebSocket 地址，响应 `OK url <url>` 或 `ERR CONFIG_* <msg>` |
-| 推送 | `STATE <state>` | 状态变化；新连接立即收到快照 |
-| 推送 | `URL <url>` | 地址变化 |
-| 推送 | `ERROR <code> <msg>` / `NONE` | 错误上报/清除 |
-
-socket 断连时本模块向 App 上报 `ERROR VOICE_UNAVAILABLE`，重连后由快照恢复显示。
-`URL` 推送只在地址变化时发生，因此 socket 连接/重连后本模块会主动发送一次
-`get_url`，把当前生效地址同步到 URL 特征值，保证 App 订阅后能立即看到地址。
 
 ### 电池状态
 
-电池状态是本模块自己的功能，不经过对话模块。模块在共享 rclpy 节点（见
+电池状态是本模块自己的功能。模块在共享 rclpy 节点（见
 `ros_runtime.py`）上订阅 `battery.topic` 配置的 `sensor_msgs/BatteryState` 话题
 （默认 `/battery_state`，QoS 用 sensor data/best-effort，兼容可靠与尽力发布的
 驱动），收到消息即更新缓存值。
@@ -172,22 +160,25 @@ bandwidth:
   notify_threshold: 10.0
 ```
 
-### 对话服务器延迟
+### 局域网控制口与音频下发口
 
-延迟探测同样是本模块自己的功能。模块从控制 socket 同步当前生效的
-WebSocket 地址，按 `latency.poll_interval_secs`（默认 5 秒）周期向其主机
-发起 TCP 建连，以建连耗时近似 ping 延迟（不需要 root 的 ICMP raw socket，
-无子进程调用）。尚未同步到地址时探测挂起，App 侧显示 `UNKNOWN`；服务器
-不可达时上报 `LATENCY -`。仅当延迟变化达到
-`latency.notify_threshold_ms`（默认 10 毫秒）或可达性变化时才通知 App。
+LAN Endpoint 和 Audio Endpoint 是只读特征值（无 Notify）。模块把
+`NetworkProvider` 拿到的 IPv4 与配置的 LAN 端口（默认 4205）拼成控制地址；
+再周期 TCP 查询本机 `pcm_tcp_server` 的查询口（默认 127.0.0.1:4204）得到
+PCM 播放端口（默认 4203），拼成音频下发地址。查询失败或没有 IPv4 时为
+`UNKNOWN`，不猜测端口。
 
 配置示例：
 
 ```yaml
-latency:
+lan:
+  host: 0.0.0.0
+  port: 4205
+
+audio:
+  query_host: 127.0.0.1
+  query_port: 4204
   poll_interval_secs: 5
-  notify_threshold_ms: 10.0
-  connect_timeout_secs: 2.0
 ```
 
 ### WiFi 配网
@@ -209,22 +200,27 @@ wifi:
   connect_timeout_secs: 30.0   # 单次配网最长等待时间，超时按 FAILED timeout 上报
 ```
 
-行为控制同样是本模块自己的功能。App 向 Robot Control 特征值写入命令名（如
-`stand_up`），模块按 `robot_control.commands` 配置的“命令名 → ROS2 服务”映射，
-在共享 rclpy 节点上异步调用对应的 `std_srvs/Trigger` 服务（服务类型固定为
-Trigger，映射只需写服务名）。命令执行成功完全静默；失败（命令不存在、服务
+行为控制同样是本模块自己的功能。App 向 Robot Control 特征值（或 TCP `ROBOT`
+通道）写入命令名。姿态命令（`stand_up`、`squat` / `lie_down`）按
+`robot_control.commands` 映射，在共享 rclpy 节点上异步调用对应的
+`std_srvs/Trigger` 服务；运动命令（`go_forward`、`go_back`、`turn_left`、
+`turn_right`、`dance`、`nod`）作为 `std_msgs/String` 发布到
+`robot_control.topic`（默认 `/xiaozhi_topic`，由 `xiaozhi_cmd_bridge`
+执行一段时间后自动停下）。命令执行成功完全静默；失败（命令不存在、服务
 不在线、`success=false`、调用超时）通过特征值 Notify 上报 `ERR ...`。
-需要 ROS2 环境（同电池状态）；`commands` 留空则禁用，写入任何命令都会收到
-`ERR unavailable`。
+需要 ROS2 环境（同电池状态）；`commands` 与 `topic` 都空则禁用，写入任何
+命令都会收到 `ERR unavailable`。
 
 配置示例：
 
 ```yaml
 robot_control:
   call_timeout_secs: 10.0    # 单次服务调用超时，超时按失败上报
+  topic: /xiaozhi_topic      # 运动命令话题；留空禁用前进/跳舞/点头等
   commands:
     stand_up: /base_bridge/stand_up
     lie_down: /base_bridge/lie_down
+    squat: /base_bridge/lie_down
 ```
 
 ### 导航任务控制
@@ -343,11 +339,12 @@ uv pip install -e ".[dev]"
 
 ## 运行
 
-对话模块需配置 `control.mode: external`（监听默认 `/tmp/xiaozhi-control.sock`）。
+PCM 播放由独立的 `pcm_tcp_server.py` 提供（默认 PCM 口 4203、查询口 4204），
+需与本模块同时运行，App 才能查到 Audio Endpoint。
 
 ```bash
 cp config.yaml.example ~/.config/xiaozhi-ble/config.yaml
-# 按需修改 socket 路径、适配器、广播名称
+# 按需修改适配器、广播名称、LAN 端口
 uv run xiaozhi-ble
 # 或指定配置文件
 uv run xiaozhi-ble --config /path/to/config.yaml
@@ -355,17 +352,18 @@ uv run xiaozhi-ble --config /path/to/config.yaml
 
 ## 部署（systemd）
 
-模块自带 `xiaozhi-ble.service`。移动模块目录后，修改文件里标注的三处路径
-（`WorkingDirectory`、`ExecStart`），然后：
+模块自带 `xiaozhi-ble.service` 和 `pcm_tcp_server.service`。移动路径后，修改
+各文件里标注的 `WorkingDirectory` / `ExecStart`，然后：
 
 ```bash
-sudo cp xiaozhi-ble.service /etc/systemd/system/
+sudo cp xiaozhi-ble.service pcm_tcp_server.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now xiaozhi-ble.service
+sudo systemctl enable --now xiaozhi-ble.service pcm_tcp_server.service
 ```
 
-与对话模块（`xiaozhi.service`）无启动顺序依赖：socket 客户端会自动重连，
-两侧任意先后启动、任意一方重启都能自动恢复。
+`pcm_tcp_server.service` 跑 `/home/sunrise/pcm_tcp_server.py`（PCM :4203，
+查询口 :4204）。两边无启动顺序依赖：音频查询失败时 Audio Endpoint 为
+`UNKNOWN`，查询口恢复后自动更新缓存。
 
 ## 测试
 
@@ -373,8 +371,8 @@ sudo systemctl enable --now xiaozhi-ble.service
 uv run pytest tests/
 ```
 
-GATT 测试不依赖真实蓝牙适配器（只构造 D-Bus 接口对象）；socket 客户端测试
-使用本地假服务端。
+GATT 测试不依赖真实蓝牙适配器（只构造 D-Bus 接口对象）；LAN 与音频查询测试
+使用本机临时 listen 的假服务端。
 
 注意：如果当前 shell 已 source 过 ROS2 环境（如 `source /opt/ros/humble/setup.bash`），
 ROS 自带的 pytest 插件会被自动加载并与项目依赖的 pytest 版本冲突，导致测试无法
